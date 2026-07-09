@@ -24,6 +24,9 @@
 #include <utility>
 #include <vector>
 
+static const unsigned char TX_REPLAY_BYTES = 0x3f;
+static const int32_t TX_REPLAY_VERSION = 12566463;
+
 /** An outpoint - a combination of a transaction hash and an index n into its vout */
 class COutPoint
 {
@@ -203,6 +206,12 @@ void UnserializeTransaction(TxType& tx, Stream& s, const TransactionSerParams& p
     const bool fAllowWitness = params.allow_witness;
 
     s >> tx.version;
+
+    if (tx.version == TX_REPLAY_VERSION) {
+        unsigned char noreplay;
+        s >> noreplay;
+    }
+
     unsigned char flags = 0;
     tx.vin.clear();
     tx.vout.clear();
@@ -243,6 +252,11 @@ void SerializeTransaction(const TxType& tx, Stream& s, const TransactionSerParam
     const bool fAllowWitness = params.allow_witness;
 
     s << tx.version;
+
+    if (tx.version == TX_REPLAY_VERSION) {
+        s << TX_REPLAY_BYTES;
+    }
+
     unsigned char flags = 0;
     // Consistency check
     if (fAllowWitness) {
