@@ -4136,6 +4136,16 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
     if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-diffbits", "incorrect proof of work");
 
+    // Enforce Drivechain fork difficulty reset
+    if (nHeight == consensusParams.DrivechainHeight) {
+        const arith_uint256 bnPoWDA = UintToArith256(consensusParams.powLimit);
+        if (block.nBits != bnPoWDA.GetCompact()) {
+            LogInfo("%s: Invalid diffbits for Drivechain DA at height: %u.\n", __func__, nHeight);
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-diffbits-drivechain-da", "Bits invalid for Drivechain DA height block!");
+        }
+        LogInfo("%s: Drivechain fork birthday DA activated! Height: %u\n", __func__, nHeight);
+    }
+
     // Check timestamp against prev
     if (block.GetBlockTime() <= pindexPrev->GetMedianTimePast())
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "time-too-old", "block's timestamp is too early");
