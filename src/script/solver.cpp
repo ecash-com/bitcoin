@@ -29,6 +29,7 @@ std::string GetTxnOutputType(TxoutType t)
     case TxoutType::WITNESS_V0_SCRIPTHASH: return "witness_v0_scripthash";
     case TxoutType::WITNESS_V1_TAPROOT: return "witness_v1_taproot";
     case TxoutType::WITNESS_UNKNOWN: return "witness_unknown";
+    case TxoutType::DRIVECHAIN: return "drivechain";
     } // no default case, so the compiler can warn about missing cases
     assert(false);
 }
