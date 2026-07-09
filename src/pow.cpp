@@ -78,6 +78,11 @@ unsigned int CalculateNextWorkRequired(const CBlockIndex* pindexLast, int64_t nF
     bnNew *= nActualTimespan;
     bnNew /= params.nPowTargetTimespan;
 
+    // Drivechain fork activation difficulty reset
+    if (pindexLast->nHeight + 1 == params.DrivechainHeight)
+        bnNew = bnPowLimit;
+
+
     if (bnNew > bnPowLimit)
         bnNew = bnPowLimit;
 

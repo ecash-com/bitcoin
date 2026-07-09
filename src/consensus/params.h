@@ -84,6 +84,8 @@ struct BIP9Deployment {
 struct Params {
     uint256 hashGenesisBlock;
     int nSubsidyHalvingInterval;
+    /** Drivechain rules become active */
+    int DrivechainHeight;
     /**
      * Hashes of blocks that
      * - are known to be consensus valid, and
