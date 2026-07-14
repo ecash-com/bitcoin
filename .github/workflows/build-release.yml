@@ -1,0 +1,317 @@
+name: Build and Release
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+env:
+  # Branches that trigger uploads to releases.drivechain.info
+  RELEASE_BRANCHES: |
+    master
+    drynet1
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check-release:
+    name: Check if release upload needed
+    runs-on: ubuntu-latest
+    outputs:
+      should-upload: ${{ steps.check.outputs.should-upload }}
+    steps:
+      - name: Check branch against release list
+        id: check
+        run: |
+          echo "Event: ${{ github.event_name }}"
+          echo "Repository owner: ${{ github.repository_owner }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Release branches:"
+          echo "${{ env.RELEASE_BRANCHES }}"
+          echo "---"
+
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "::notice::Skipping upload: not a push event"
+            echo "should-upload=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${{ github.repository_owner }}" != "ecash-com" ]; then
+            echo "::notice::Skipping upload: not ecash-com repo"
+            echo "should-upload=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          RELEASE_BRANCHES="${{ env.RELEASE_BRANCHES }}"
+          if echo "$RELEASE_BRANCHES" | grep -qx "${{ github.ref_name }}"; then
+            echo "::notice::Will upload: branch '${{ github.ref_name }}' is in release list"
+            echo "should-upload=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Skipping upload: branch '${{ github.ref_name }}' not in release list"
+            echo "should-upload=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build ${{ matrix.artifact-suffix }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-24.04
+            timeout: 120
+            artifact-suffix: x86_64-unknown-linux-gnu
+            exe-ext: ""
+            build-subdir: ""
+          - platform: windows
+            os: windows-2025-vs2026
+            timeout: 360
+            artifact-suffix: x86_64-w64-msvc
+            exe-ext: ".exe"
+            build-subdir: "Release/"
+          - platform: macos
+            os: macos-15-intel
+            timeout: 120
+            artifact-suffix: x86_64-apple-darwin
+            exe-ext: ""
+            build-subdir: ""
+          - platform: macos
+            os: macos-15
+            timeout: 120
+            artifact-suffix: aarch64-apple-darwin
+            exe-ext: ""
+            build-subdir: ""
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # Set branch suffix for artifact names (empty on master, branch name otherwise)
+      - name: Set artifact branch suffix
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [ "${{ github.ref }}" == "refs/heads/master" ]; then
+            echo "BRANCH_SUFFIX=" >> "$GITHUB_ENV"
+          elif [ "${{ github.event_name }}" == "pull_request" ]; then
+            # Sanitize branch name (replace / with -)
+            BRANCH=$(echo "$HEAD_REF" | sed 's/\//-/g')
+            echo "BRANCH_SUFFIX=-${BRANCH}" >> "$GITHUB_ENV"
+          else
+            # Push to non-master branch
+            BRANCH=$(echo "${{ github.ref_name }}" | sed 's/\//-/g')
+            echo "BRANCH_SUFFIX=-${BRANCH}" >> "$GITHUB_ENV"
+          fi
+
+      #
+      # Platform-specific setup
+      #
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        # Host tools for building the depends tree, see depends/README.md
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake curl bison \
+              ninja-build pkgconf python3 xz-utils
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
+      - name: Install macOS dependencies
+        if: matrix.platform == 'macos'
+        run: |
+          # GNU grep is required, as BSD grep does not support perl regexes
+          # GNU make is required, as macOS ships with GNU Make 3.81 which
+          # mishandles -j flags in MAKEFLAGS, breaking the depends Qt build
+          brew install --quiet cmake grep make ninja
+
+      - name: Import Visual Studio env vars
+        if: matrix.platform == 'windows'
+        run: py -3 .github/ci-windows.py standard github_import_vs_env
+
+      - name: Get Windows tool information
+        if: matrix.platform == 'windows'
+        run: |
+          set -o errexit -o pipefail -o xtrace -o nounset
+
+          cmake -version | tee cmake_version
+          echo '---'
+          msbuild.exe -version | tee msbuild_version
+          echo "${VCToolsVersion-}" | tee toolset_version
+          py -3 --version
+          bash --version
+
+      - name: Configure vcpkg for Windows
+        if: matrix.platform == 'windows'
+        run: |
+          echo "set(VCPKG_BUILD_TYPE release)" >> "${VCPKG_INSTALLATION_ROOT}/triplets/x64-windows.cmake"
+          echo "set(VCPKG_BUILD_TYPE release)" >> "${VCPKG_INSTALLATION_ROOT}/triplets/x64-windows-static.cmake"
+          # Workaround for libevent, which requires CMake 3.1 but is incompatible with CMake >= 4.0.
+          sed -i '1s/^/set(ENV{CMAKE_POLICY_VERSION_MINIMUM} 3.5)\n/' "${VCPKG_INSTALLATION_ROOT}/scripts/ports.cmake"
+          echo "VCPKG_ROOT=${VCPKG_INSTALLATION_ROOT}" >> "$GITHUB_ENV"
+
+      #
+      # Cache handling
+      #
+      - name: Restore depends cache (Linux/macOS)
+        if: matrix.platform != 'windows'
+        uses: actions/cache/restore@v5
+        with:
+          path: ./depends
+          key: ${{ matrix.artifact-suffix }}-${{ hashFiles('depends/packages/**') }}
+
+      - name: Restore vcpkg tools cache (Windows)
+        if: matrix.platform == 'windows'
+        uses: actions/cache@v5
+        with:
+          path: C:/vcpkg/downloads/tools
+          key: ${{ github.job }}-vcpkg-tools
+
+      - name: Restore vcpkg binary cache (Windows)
+        if: matrix.platform == 'windows'
+        uses: actions/cache/restore@v5
+        id: vcpkg-binary-cache
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: ${{ github.job }}-vcpkg-binary-${{ hashFiles('cmake_version', 'msbuild_version', 'toolset_version', 'vcpkg.json') }}
+
+      #
+      # Build dependencies (Linux/macOS only - Windows uses vcpkg)
+      #
+      - name: Download dependencies (Linux)
+        if: matrix.platform == 'linux'
+        run: make -C ./depends download-linux
+
+      - name: Download dependencies (macOS)
+        if: matrix.platform == 'macos'
+        run: gmake -C ./depends download-osx
+
+      - name: Build dependencies (Linux)
+        if: matrix.platform == 'linux'
+        run: make -C ./depends -j4
+
+      - name: Build dependencies (macOS)
+        if: matrix.platform == 'macos'
+        run: gmake -C ./depends -j4
+
+      - name: Save depends cache (Linux/macOS)
+        if: matrix.platform != 'windows'
+        uses: actions/cache/save@v5
+        with:
+          path: ./depends
+          key: ${{ matrix.artifact-suffix }}-${{ hashFiles('depends/packages/**') }}
+
+      #
+      # Configure and build
+      #
+      - name: Configure build (Linux)
+        if: matrix.platform == 'linux'
+        run: cmake -B build --toolchain depends/x86_64-pc-linux-gnu/toolchain.cmake
+
+      - name: Configure build (macOS)
+        if: matrix.platform == 'macos'
+        run: cmake -B build -DBUILD_GUI=ON --toolchain depends/*-apple-darwin*/toolchain.cmake
+
+      - name: Configure build (Windows)
+        if: matrix.platform == 'windows'
+        run: |
+          cmake -B build --preset vs2026-static \
+            -DBUILD_GUI=ON -DWITH_ZMQ=ON \
+            -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF -DBUILD_TESTS=OFF -DBUILD_UTIL=ON
+
+      - name: Save vcpkg binary cache (Windows)
+        if: matrix.platform == 'windows' && github.event_name != 'pull_request' && steps.vcpkg-binary-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: ${{ github.job }}-vcpkg-binary-${{ hashFiles('cmake_version', 'msbuild_version', 'toolset_version', 'vcpkg.json') }}
+
+      - name: Build (Linux/macOS)
+        if: matrix.platform != 'windows'
+        run: cmake --build build -j4
+
+      - name: Build (Windows)
+        if: matrix.platform == 'windows'
+        run: cmake --build build -j "$NUMBER_OF_PROCESSORS" --config Release
+
+      #
+      # Extract version and prepare artifacts
+      #
+      - name: Set version environment variable
+        run: |
+          if [ "${{ matrix.platform }}" == "macos" ]; then
+            VERSION=$(ggrep -oP "(?<=^CMAKE_PROJECT_VERSION:STATIC=).+(?=)" build/CMakeCache.txt)
+          else
+            VERSION=$(grep -oP "(?<=^CMAKE_PROJECT_VERSION:STATIC=).+(?=$)" build/CMakeCache.txt || \
+                      grep CMAKE_PROJECT_VERSION:STATIC build/CMakeCache.txt | cut -d= -f2)
+          fi
+          echo "ECASH_BITCOIN_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts/qt
+          mv "build/bin/${{ matrix.build-subdir }}bitcoind${{ matrix.exe-ext }}" artifacts/
+          mv "build/bin/${{ matrix.build-subdir }}bitcoin-cli${{ matrix.exe-ext }}" artifacts/
+          mv "build/bin/${{ matrix.build-subdir }}bitcoin-util${{ matrix.exe-ext }}" artifacts/
+          mv "build/bin/${{ matrix.build-subdir }}bitcoin-qt${{ matrix.exe-ext }}" artifacts/qt/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ecash-bitcoin-${{ env.ECASH_BITCOIN_VERSION }}${{ env.BRANCH_SUFFIX }}-${{ matrix.artifact-suffix }}
+          if-no-files-found: error
+          path: |
+            artifacts/bitcoind${{ matrix.exe-ext }}
+            artifacts/bitcoin-cli${{ matrix.exe-ext }}
+            artifacts/bitcoin-util${{ matrix.exe-ext }}
+            artifacts/qt/bitcoin-qt${{ matrix.exe-ext }}
+
+  upload-artifacts-to-releases-drivechain-info:
+    name: Upload artifacts to releases.drivechain.info
+    runs-on: ubuntu-latest
+    needs: [check-release, build]
+    if: needs.check-release.outputs.should-upload == 'true'
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+
+      - name: Determine version label
+        id: version
+        run: |
+          if [ "${{ github.ref }}" == "refs/heads/master" ]; then
+            echo "label=latest" >> "$GITHUB_OUTPUT"
+          else
+            # Sanitize branch name for filename
+            BRANCH=$(echo "${{ github.ref_name }}" | sed 's/\//-/g')
+            echo "label=${BRANCH}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Zip artifacts
+        run: |
+          set -euo pipefail
+          ARTIFACT_PREFIX="L1-ecash-bitcoin-${{ steps.version.outputs.label }}"
+
+          for suffix in aarch64-apple-darwin x86_64-apple-darwin x86_64-w64-msvc x86_64-unknown-linux-gnu; do
+            # Find the artifact directory (may have version and branch suffix)
+            src_dir=$(find . -maxdepth 1 -type d -name "ecash-bitcoin-*-${suffix}" | head -1)
+            if [ -z "$src_dir" ]; then
+              echo "::error::No artifact found matching ecash-bitcoin-*-${suffix}"
+              exit 1
+            fi
+            dest_dir="${ARTIFACT_PREFIX}-${suffix}"
+            mv "$src_dir" "$dest_dir"
+            zip -r "${dest_dir}.zip" "$dest_dir"
+          done
+
+      - name: Upload artifacts to releases.drivechain.info
+        # cross-the-world/ssh-scp-ssh-pipelines is broken and unmaintained
+        # use a fork by a random chinese company (?). pin a specific version
+        # to limit the amount of shenanigans they can pull
+        uses: yitianyigexiangfa/ssh-scp-ssh-pipelines@v1.1.5
+        with:
+          host: 45.33.96.47
+          user: root
+          pass: ${{ secrets.RELEASES_SERVER_PW }}
+          port: 22
+          scp: |
+            'L1-ecash-bitcoin-*.zip' => '/var/www/html/'
