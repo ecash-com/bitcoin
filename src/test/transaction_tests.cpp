@@ -1319,4 +1319,37 @@ BOOST_AUTO_TEST_CASE(spends_witness_prog)
     }
 }
 
+BOOST_AUTO_TEST_CASE(tx_replay_protection_locktime)
+{
+    // A transaction stamped with the magic nLockTime (LOCKTIME_THRESHOLD - 1) is
+    // always final here, so it confirms on this chain. Stock Bitcoin Core reads
+    // the same value as a block height roughly 500 million blocks away and
+    // rejects the transaction as non-final, so it can never replay onto Bitcoin.
+    CMutableTransaction tx;
+    tx.vin.resize(1);
+    // nLockTime is only enforced when at least one input is non-final.
+    tx.vin[0].nSequence = CTxIn::SEQUENCE_FINAL - 1;
+    tx.vout.resize(1);
+    tx.vout[0].nValue = 0;
+
+    // The magic locktime is final at any height and time.
+    tx.nLockTime = LOCKTIME_THRESHOLD - 1;
+    BOOST_CHECK(IsFinalTx(CTransaction(tx), /*nBlockHeight=*/1, /*nBlockTime=*/0));
+
+    // One below the magic value is an ordinary height lock, so it stays
+    // non-final until that height is reached.
+    tx.nLockTime = LOCKTIME_THRESHOLD - 2;
+    BOOST_CHECK(!IsFinalTx(CTransaction(tx), /*nBlockHeight=*/1, /*nBlockTime=*/0));
+
+    // An unlocked transaction is final, as always.
+    tx.nLockTime = 0;
+    BOOST_CHECK(IsFinalTx(CTransaction(tx), /*nBlockHeight=*/1, /*nBlockTime=*/0));
+
+    // A fully final input makes any transaction final, so the magic value
+    // changes nothing there.
+    tx.nLockTime = LOCKTIME_THRESHOLD - 2;
+    tx.vin[0].nSequence = CTxIn::SEQUENCE_FINAL;
+    BOOST_CHECK(IsFinalTx(CTransaction(tx), /*nBlockHeight=*/1, /*nBlockTime=*/0));
+}
+
 BOOST_AUTO_TEST_SUITE_END()
