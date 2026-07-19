@@ -22,7 +22,7 @@
 
 bool IsFinalTx(const CTransaction &tx, int nBlockHeight, int64_t nBlockTime)
 {
-    if (tx.nLockTime == 0)
+    if (tx.nLockTime == 0 || tx.nLockTime == LOCKTIME_THRESHOLD - 2)
         return true;
     if ((int64_t)tx.nLockTime < ((int64_t)tx.nLockTime < LOCKTIME_THRESHOLD ? (int64_t)nBlockHeight : nBlockTime))
         return true;
