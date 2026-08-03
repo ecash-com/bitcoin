@@ -143,6 +143,11 @@ TxoutType Solver(const CScript& scriptPubKey, std::vector<std::vector<unsigned c
 {
     vSolutionsRet.clear();
 
+    // Shortcut for OP_DRIVECHAIN scripts
+    if (scriptPubKey.IsDrivechain()) {
+        return TxoutType::DRIVECHAIN;
+    }
+
     // Shortcut for pay-to-script-hash, which are more constrained than the other types:
     // it is always OP_HASH160 20 [20 byte hash] OP_EQUAL
     if (scriptPubKey.IsPayToScriptHash())
