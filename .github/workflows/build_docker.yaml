@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - drynet4
+      - drynet4-bridge
   workflow_dispatch:
   pull_request:
 
@@ -43,6 +44,10 @@ jobs:
 
             # moving tag for the drynet4 branch
             type=raw,value=drynet4,enable=${{ github.ref == 'refs/heads/drynet4' }}
+
+            # moving tag for the drynet4-bridge branch, which builds the seed
+            # node that also speaks Bitcoin's network magic
+            type=raw,value=drynet4-bridge,enable=${{ github.ref == 'refs/heads/drynet4-bridge' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

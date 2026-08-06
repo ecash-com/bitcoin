@@ -105,6 +105,8 @@ typedef int64_t NodeId;
 struct AddedNodeParams {
     std::string m_added_node;
     bool m_use_v2transport;
+    //! Speak Bitcoin's network magic to this peer rather than our own.
+    bool m_bitcoin_magic{false};
 };
 
 struct AddedNodeInfo {
@@ -421,7 +423,7 @@ private:
     size_t m_bytes_sent GUARDED_BY(m_send_mutex) {0};
 
 public:
-    explicit V1Transport(NodeId node_id) noexcept;
+    V1Transport(NodeId node_id, const MessageStartChars& magic) noexcept;
 
     bool ReceivedMessageComplete() const override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex)
     {
@@ -674,6 +676,8 @@ struct CNodeOptions
     bool prefer_evict = false;
     size_t recv_flood_size{DEFAULT_MAXRECEIVEBUFFER * 1000};
     bool use_v2transport = false;
+    //! Network magic for this connection. Defaults to our own chain's.
+    std::optional<MessageStartChars> magic{};
 };
 
 /** Information about a peer */
@@ -725,6 +729,10 @@ public:
     const std::string m_dest;
     //! Whether this peer is an inbound onion, i.e. connected via our Tor onion service.
     const bool m_inbound_onion;
+    //! Whether we speak Bitcoin's network magic to this peer rather than our own.
+    //! Such peers live on a different network, so we must not exchange addresses
+    //! with them in either direction.
+    const bool m_bitcoin_magic;
     std::atomic<int> nVersion{0};
     Mutex m_subver_mutex;
     /**
@@ -1100,6 +1108,8 @@ public:
         bool m_use_addrman_outgoing = true;
         std::vector<std::string> m_specified_outgoing;
         std::vector<std::string> m_added_nodes;
+        //! Peers to reach over Bitcoin's network magic instead of ours.
+        std::vector<std::string> m_bitcoin_peers;
         bool m_i2p_accept_incoming;
         bool whitelist_forcerelay = DEFAULT_WHITELISTFORCERELAY;
         bool whitelist_relay = DEFAULT_WHITELISTRELAY;
@@ -1136,6 +1146,12 @@ public:
             const bool use_v2transport(GetLocalServices() & NODE_P2P_V2);
             for (const std::string& added_node : connOptions.m_added_nodes) {
                 m_added_node_params.push_back({added_node, use_v2transport});
+            }
+            // Bitcoin peers are dialled as manual connections like -addnode, but
+            // over v1 only: BIP324 has no magic bytes to swap, so a v2 session
+            // would give us no way to speak Bitcoin's protocol flavour.
+            for (const std::string& bitcoin_peer : connOptions.m_bitcoin_peers) {
+                m_added_node_params.push_back({bitcoin_peer, /*m_use_v2transport=*/false, /*m_bitcoin_magic=*/true});
             }
         }
         m_onion_binds = connOptions.onion_binds;
@@ -1191,7 +1207,8 @@ public:
                                const char* pszDest,
                                ConnectionType conn_type,
                                bool use_v2transport,
-                               const std::optional<Proxy>& proxy_override)
+                               const std::optional<Proxy>& proxy_override,
+                               bool bitcoin_magic = false)
         EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
 
     /// Group of private broadcast related members.
@@ -1527,7 +1544,8 @@ private:
                        bool fCountFailure,
                        ConnectionType conn_type,
                        bool use_v2transport,
-                       const std::optional<Proxy>& proxy_override)
+                       const std::optional<Proxy>& proxy_override,
+                       bool bitcoin_magic = false)
         EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
 
     void AddWhitelistPermissionFlags(NetPermissionFlags& flags, std::optional<CNetAddr> addr, const std::vector<NetWhitelistPermissions>& ranges) const;

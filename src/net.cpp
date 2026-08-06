@@ -53,6 +53,14 @@ TRACEPOINT_SEMAPHORE(net, inbound_connection);
 TRACEPOINT_SEMAPHORE(net, outbound_connection);
 TRACEPOINT_SEMAPHORE(net, outbound_message);
 
+/** Bitcoin mainnet's message start bytes.
+ *
+ * Spelled out rather than read from CChainParams::Main(), which carries our own
+ * magic. Used only by -bitcoinpeer connections, so that this node can fetch the
+ * pre-fork chain straight from Bitcoin's p2p network while serving it onwards
+ * under our own magic. */
+static constexpr MessageStartChars BITCOIN_MAINNET_MAGIC{0xf9, 0xbe, 0xb4, 0xd9};
+
 /** Maximum number of block-relay-only anchor connections */
 static constexpr size_t MAX_BLOCK_RELAY_ONLY_ANCHORS = 2;
 static_assert (MAX_BLOCK_RELAY_ONLY_ANCHORS <= static_cast<size_t>(MAX_BLOCK_RELAY_ONLY_CONNECTIONS), "MAX_BLOCK_RELAY_ONLY_ANCHORS must not exceed MAX_BLOCK_RELAY_ONLY_CONNECTIONS.");
@@ -374,10 +382,13 @@ CNode* CConnman::ConnectNode(CAddress addrConnect,
                              bool fCountFailure,
                              ConnectionType conn_type,
                              bool use_v2transport,
-                             const std::optional<Proxy>& proxy_override)
+                             const std::optional<Proxy>& proxy_override,
+                             bool bitcoin_magic)
 {
     AssertLockNotHeld(m_unused_i2p_sessions_mutex);
     assert(conn_type != ConnectionType::INBOUND);
+    // A foreign magic is only meaningful over v1; see MakeTransport().
+    assert(!(bitcoin_magic && use_v2transport));
 
     if (pszDest == nullptr) {
         if (IsLocal(addrConnect))
@@ -543,6 +554,7 @@ CNode* CConnman::ConnectNode(CAddress addrConnect,
                                     .i2p_sam_session = std::move(i2p_transient_session),
                                     .recv_flood_size = nReceiveFloodSize,
                                     .use_v2transport = use_v2transport,
+                                    .magic = bitcoin_magic ? std::optional{BITCOIN_MAINNET_MAGIC} : std::nullopt,
                                 });
         pnode->AddRef();
 
@@ -717,8 +729,8 @@ std::string CNode::DisconnectMsg(bool log_ip) const
                      LogIP(log_ip));
 }
 
-V1Transport::V1Transport(const NodeId node_id) noexcept
-    : m_magic_bytes{Params().MessageStart()}, m_node_id{node_id}
+V1Transport::V1Transport(const NodeId node_id, const MessageStartChars& magic) noexcept
+    : m_magic_bytes{magic}, m_node_id{node_id}
 {
     LOCK(m_recv_mutex);
     Reset();
@@ -1001,7 +1013,7 @@ V2Transport::V2Transport(NodeId nodeid, bool initiating, const CKey& key, std::s
     : m_cipher{key, ent32},
       m_initiating{initiating},
       m_nodeid{nodeid},
-      m_v1_fallback{nodeid},
+      m_v1_fallback{nodeid, Params().MessageStart()},
       m_recv_state{initiating ? RecvState::KEY : RecvState::KEY_MAYBE_V1},
       m_send_garbage{std::move(garbage)},
       m_send_state{initiating ? SendState::AWAITING_KEY : SendState::MAYBE_V1}
@@ -3016,7 +3028,8 @@ void CConnman::ThreadOpenAddedConnections()
                                   /*pszDest=*/info.m_params.m_added_node.c_str(),
                                   /*conn_type=*/ConnectionType::MANUAL,
                                   /*use_v2transport=*/info.m_params.m_use_v2transport,
-                                  /*proxy_override=*/std::nullopt);
+                                  /*proxy_override=*/std::nullopt,
+                                  /*bitcoin_magic=*/info.m_params.m_bitcoin_magic);
             if (!m_interrupt_net->sleep_for(500ms)) return;
             grant = CountingSemaphoreGrant<>(*semAddnode, /*fTry=*/true);
         }
@@ -3036,7 +3049,8 @@ bool CConnman::OpenNetworkConnection(const CAddress& addrConnect,
                                      const char* pszDest,
                                      ConnectionType conn_type,
                                      bool use_v2transport,
-                                     const std::optional<Proxy>& proxy_override)
+                                     const std::optional<Proxy>& proxy_override,
+                                     bool bitcoin_magic)
 {
     AssertLockNotHeld(m_unused_i2p_sessions_mutex);
     assert(conn_type != ConnectionType::INBOUND);
@@ -3059,7 +3073,7 @@ bool CConnman::OpenNetworkConnection(const CAddress& addrConnect,
         return false;
     }
 
-    CNode* pnode = ConnectNode(addrConnect, pszDest, fCountFailure, conn_type, use_v2transport, proxy_override);
+    CNode* pnode = ConnectNode(addrConnect, pszDest, fCountFailure, conn_type, use_v2transport, proxy_override, bitcoin_magic);
 
     if (!pnode)
         return false;
@@ -3989,12 +4003,16 @@ ServiceFlags CConnman::GetLocalServices() const
     return m_local_services;
 }
 
-static std::unique_ptr<Transport> MakeTransport(NodeId id, bool use_v2transport, bool inbound) noexcept
+static std::unique_ptr<Transport> MakeTransport(NodeId id, bool use_v2transport, bool inbound, const MessageStartChars& magic) noexcept
 {
     if (use_v2transport) {
+        // V2Transport carries no magic bytes of its own, and its v1 fallback is
+        // built with our own chain's. Callers must not ask for both v2 and a
+        // foreign magic; -bitcoinpeer connections are forced to v1 for this reason.
+        Assume(magic == Params().MessageStart());
         return std::make_unique<V2Transport>(id, /*initiating=*/!inbound);
     } else {
-        return std::make_unique<V1Transport>(id);
+        return std::make_unique<V1Transport>(id, magic);
     }
 }
 
@@ -4009,7 +4027,8 @@ CNode::CNode(NodeId idIn,
              bool inbound_onion,
              uint64_t network_key,
              CNodeOptions&& node_opts)
-    : m_transport{MakeTransport(idIn, node_opts.use_v2transport, conn_type_in == ConnectionType::INBOUND)},
+    : m_transport{MakeTransport(idIn, node_opts.use_v2transport, conn_type_in == ConnectionType::INBOUND,
+                                node_opts.magic.value_or(Params().MessageStart()))},
       m_permission_flags{node_opts.permission_flags},
       m_sock{sock},
       m_connected{GetTime<std::chrono::seconds>()},
@@ -4019,6 +4038,7 @@ CNode::CNode(NodeId idIn,
       m_addr_name{addrNameIn.empty() ? addr.ToStringAddrPort() : addrNameIn},
       m_dest(addrNameIn),
       m_inbound_onion{inbound_onion},
+      m_bitcoin_magic{node_opts.magic.has_value()},
       m_prefer_evict{node_opts.prefer_evict},
       nKeyedNetGroup{nKeyedNetGroupIn},
       m_network_key{network_key},
