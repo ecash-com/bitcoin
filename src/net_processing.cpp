@@ -57,6 +57,8 @@
 #include <txmempool.h>
 #include <uint256.h>
 #include <util/check.h>
+#include <util/fs.h>
+#include <util/fs_helpers.h>
 #include <util/strencodings.h>
 #include <util/time.h>
 #include <util/trace.h>
@@ -68,6 +70,7 @@
 #include <compare>
 #include <cstddef>
 #include <deque>
+#include <fstream>
 #include <exception>
 #include <functional>
 #include <future>
@@ -128,6 +131,20 @@ static const unsigned int MAX_INV_SZ = 50000;
 static const unsigned int MAX_GETDATA_SZ = 1000;
 /** Number of blocks that can be requested at any given time from a single peer. */
 static const int MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16;
+/** Bridge: how long to wait for a requested Bitcoin block before asking for it again. */
+static constexpr auto BRIDGE_BLOCK_TIMEOUT{60s};
+/** Bridge: how often to ask a Bitcoin peer for headers, in case an announcement was missed. */
+static constexpr auto BRIDGE_HEADERS_POLL_INTERVAL{120s};
+/** Bridge: processed Bitcoin headers this far below the foreign tip are forgotten. */
+static constexpr int BRIDGE_FOREIGN_KEEP_HEIGHTS{2000};
+/** Bridge: cap on Bitcoin headers held per peer (a year of Bitcoin blocks). */
+static constexpr size_t BRIDGE_MAX_FOREIGN_HEADERS{60000};
+/** Bridge: file (in the network datadir) holding the last fed "<hash> <height>". */
+static constexpr const char* BRIDGE_ANCHOR_FILE{"bridgefeed.dat"};
+/** Bridge: transactions rejected for a reason that may clear later are held this long and re-offered. */
+static constexpr size_t BRIDGE_HELD_TXS_MAX{2000};
+static constexpr auto BRIDGE_HELD_TXS_MAX_AGE{24h};
+static constexpr auto BRIDGE_HELD_TXS_RETRY_INTERVAL{10min};
 /** Default time during which a peer must stall block download progress before being disconnected.
  * the actual timeout is increased temporarily if peers are disconnected for hitting the timeout */
 static constexpr auto BLOCK_STALLING_TIMEOUT_DEFAULT{2s};
@@ -247,6 +264,10 @@ struct Peer {
 
     //! Whether this peer is an inbound connection
     const bool m_is_inbound;
+
+    //! Whether we speak Bitcoin's network magic to this peer. The bridge only
+    //! carries block data inwards, so nothing is ever announced to such peers.
+    const bool m_bitcoin_magic;
 
     /** Protects misbehavior data members */
     Mutex m_misbehavior_mutex;
@@ -419,10 +440,11 @@ struct Peer {
      * timestamp the peer sent in the version message. */
     std::atomic<std::chrono::seconds> m_time_offset{0s};
 
-    explicit Peer(NodeId id, ServiceFlags our_services, bool is_inbound)
+    explicit Peer(NodeId id, ServiceFlags our_services, bool is_inbound, bool bitcoin_magic)
         : m_id{id}
         , m_our_services{our_services}
         , m_is_inbound{is_inbound}
+        , m_bitcoin_magic{bitcoin_magic}
     {}
 
 private:
@@ -440,6 +462,34 @@ using PeerRef = std::shared_ptr<Peer>;
  * processing of incoming data is done after the ProcessMessage call returns,
  * and we're no longer holding the node's locks.
  */
+/**
+ * Bridge: Bitcoin's post-fork header chain as one -bitcoinpeer presents it.
+ *
+ * These headers can never be validated as our blocks (the fork resets the
+ * difficulty) and never enter the block index. They only decide which Bitcoin
+ * blocks to fetch so that their transactions can be offered to our mempool.
+ */
+struct ForeignChain {
+    struct Entry {
+        CBlockHeader header;
+        uint256 prev;
+        int height{-1};
+        //! Transactions fed to the mempool, or known to have been.
+        bool processed{false};
+        //! When the block was last requested; 0 if not in flight.
+        std::chrono::microseconds requested_at{0us};
+    };
+    std::map<uint256, Entry> entries;
+    //! Every entry by height.
+    std::multimap<int, uint256> by_height;
+    //! Unprocessed entries by height: the fetch queue.
+    std::multimap<int, uint256> pending;
+    //! Highest header seen.
+    uint256 tip;
+    int tip_height{-1};
+    std::chrono::microseconds last_poll{0us};
+};
+
 struct CNodeState {
     //! The best known block we know this peer has announced.
     const CBlockIndex* pindexBestKnownBlock{nullptr};
@@ -502,6 +552,8 @@ struct CNodeState {
 
     //! Time of last new block announcement
     int64_t m_last_block_announcement{0};
+    //! Bridge: Bitcoin's post-fork chain, for -bitcoinpeer connections only.
+    std::unique_ptr<ForeignChain> m_foreign;
 };
 
 class PeerManagerImpl final : public PeerManager
@@ -659,6 +711,40 @@ private:
     /** Various helpers for headers processing, invoked by ProcessHeadersMessage() */
     /** Return true if headers are continuous and have valid proof-of-work (DoS points assigned on failure) */
     bool CheckHeadersPoW(const std::vector<CBlockHeader>& headers, Peer& peer);
+
+    /** Bridge (-bitcoinpeer): first block height under eCash rules; 0 disables the block feed. */
+    int BridgeForkHeight() const { return m_chainman.GetConsensus().EcashHeight; }
+    /** Bridge: whether the block feed is on at all; without a fork height a -bitcoinpeer is treated as an ordinary peer. */
+    bool BridgeEnabled() const { return BridgeForkHeight() > 0; }
+    bool BridgeFeeds(const Peer& peer) const { return peer.m_bitcoin_magic && BridgeEnabled(); }
+    fs::path BridgeAnchorPath() const;
+    /** Bridge: create the peer's ForeignChain, seeded with the persisted anchor and its ancestry. */
+    void BridgeInitPeer(NodeId nodeid) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    /** Bridge: persist the last fed block. */
+    void BridgeSaveAnchor() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    /** Bridge: locator from the foreign tip down through the anchor and the fork parent into our chain. */
+    CBlockLocator BridgeLocator(NodeId nodeid) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    bool BridgeKnowsBlock(NodeId nodeid, const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    /** Bridge: record the post-fork part of a Bitcoin peer's headers; returns the pre-fork part for normal processing. */
+    std::vector<CBlockHeader> BridgeSplitHeaders(CNode& pfrom, Peer& peer, std::vector<CBlockHeader>&& headers)
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+    /** Bridge: request the next Bitcoin block in height order. */
+    void BridgeRequestBlocks(CNode& node, Peer& peer, std::chrono::microseconds now)
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, cs_main);
+    /** Bridge: feed a requested Bitcoin block's transactions. Returns false if the block is not foreign. */
+    bool BridgeProcessBlock(CNode& pfrom, Peer& peer, const std::shared_ptr<const CBlock>& block)
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_peer_mutex, !m_tx_download_mutex);
+    enum class BridgeTxResult { ACCEPTED, KNOWN, MISSING, HELD, OTHER };
+    /** Bridge: offer one Bitcoin transaction to the mempool as sendrawtransaction would; `reason` is set unless accepted or known. */
+    BridgeTxResult BridgeOfferTx(const CTransactionRef& tx, std::string& reason)
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_peer_mutex, !m_tx_download_mutex);
+    /** Bridge: keep a transaction for BridgeRetryHeldTxs (oldest evicted beyond BRIDGE_HELD_TXS_MAX). */
+    void BridgeHoldTx(const CTransactionRef& tx, std::chrono::microseconds now) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+    /** Bridge: re-offer held transactions once our tip has moved or enough time has passed. */
+    void BridgeRetryHeldTxs(std::chrono::microseconds now)
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_peer_mutex, !m_tx_download_mutex);
+    /** Bridge: mark a foreign block fed and advance the anchor. */
+    void BridgeMarkProcessed(NodeId nodeid, const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     /** Calculate an anti-DoS work threshold for headers chains */
     arith_uint256 GetAntiDoSWorkThreshold();
     /** Deal with state tracking and headers sync for peers that send
@@ -813,6 +899,21 @@ private:
 
     /** Map maintaining per-node state. */
     std::map<NodeId, CNodeState> m_node_states GUARDED_BY(cs_main);
+
+    /** Bridge: highest Bitcoin block whose whole post-fork ancestry has been fed (persisted in BRIDGE_ANCHOR_FILE). */
+    std::pair<uint256, int> m_bridge_anchor GUARDED_BY(cs_main){uint256{}, -1};
+    bool m_bridge_anchor_loaded GUARDED_BY(cs_main){false};
+    bool m_bridge_anchor_dirty GUARDED_BY(cs_main){false};
+    /** Bridge: transactions rejected for a reason that may clear later, with when they were first offered. */
+    std::deque<std::pair<CTransactionRef, std::chrono::microseconds>> m_bridge_held_txs GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+    std::set<Txid> m_bridge_held_txids GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+    uint256 m_bridge_held_tip GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+    std::chrono::microseconds m_bridge_held_retried_at GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0us};
+    /** Bridge: the Bitcoin peer fetching blocks. Others only follow headers until it leaves, stalls or idles. */
+    NodeId m_bridge_feed_peer GUARDED_BY(cs_main){-1};
+    /** Bridge: recently fed block hashes, so a peer that learns of one later does not queue it again. */
+    std::deque<uint256> m_bridge_processed_order GUARDED_BY(cs_main);
+    std::set<uint256> m_bridge_processed GUARDED_BY(cs_main);
 
     /** Get a pointer to a const CNodeState, used when not mutating the CNodeState object. */
     const CNodeState* State(NodeId pnode) const EXCLUSIVE_LOCKS_REQUIRED(cs_main);
@@ -1570,7 +1671,8 @@ void PeerManagerImpl::PushNodeVersion(CNode& pnode, const Peer& peer)
         your_addr = addr.IsRoutable() && !IsProxy(addr) && addr.IsAddrV1Compatible() ? CService{addr} : CService{};
         my_user_agent = strSubVersion;
         my_height = m_best_height;
-        my_tx_relay = !RejectIncomingTxs(pnode);
+        // Bridge: Bitcoin's transaction gossip is not our feed (its blocks are); ask for none.
+        my_tx_relay = !RejectIncomingTxs(pnode) && !(pnode.m_bitcoin_magic && BridgeEnabled());
     }
 
     MakeAndPushMessage(
@@ -1608,6 +1710,7 @@ void PeerManagerImpl::InitializeNode(const CNode& node, ServiceFlags our_service
     {
         LOCK(cs_main); // For m_node_states
         m_node_states.try_emplace(m_node_states.end(), nodeid);
+        if (node.m_bitcoin_magic && BridgeEnabled()) BridgeInitPeer(nodeid);
     }
     WITH_LOCK(m_tx_download_mutex, m_txdownloadman.CheckIsEmpty(nodeid));
 
@@ -1615,7 +1718,7 @@ void PeerManagerImpl::InitializeNode(const CNode& node, ServiceFlags our_service
         our_services = static_cast<ServiceFlags>(our_services | NODE_BLOOM);
     }
 
-    PeerRef peer = std::make_shared<Peer>(nodeid, our_services, node.IsInboundConn());
+    PeerRef peer = std::make_shared<Peer>(nodeid, our_services, node.IsInboundConn(), node.m_bitcoin_magic);
     {
         LOCK(m_peer_mutex);
         m_peer_map.emplace_hint(m_peer_map.end(), nodeid, peer);
@@ -1717,6 +1820,7 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
     m_outbound_peers_with_protect_from_disconnect -= state->m_chain_sync.m_protect;
     assert(m_outbound_peers_with_protect_from_disconnect >= 0);
 
+    if (m_bridge_feed_peer == nodeid) m_bridge_feed_peer = -1;
     m_node_states.erase(nodeid);
 
     if (m_node_states.empty()) {
@@ -2181,6 +2285,10 @@ void PeerManagerImpl::UpdatedBlockTip(const CBlockIndex *pindexNew, const CBlock
         LOCK(m_peer_mutex);
         for (auto& it : m_peer_map) {
             Peer& peer = *it.second;
+            // Our tip is only meaningful on our own chain; past the fork height a
+            // Bitcoin peer would reject it, and announcing it leaks this chain
+            // into Bitcoin's network.
+            if (peer.m_bitcoin_magic) continue;
             LOCK(peer.m_block_inv_mutex);
             for (const uint256& hash : vHashes | std::views::reverse) {
                 peer.m_blocks_for_headers_relay.push_back(hash);
@@ -2614,6 +2722,449 @@ void PeerManagerImpl::SendBlockTransactions(CNode& pfrom, Peer& peer, const CBlo
         LogDebug(BCLog::CMPCTBLOCK, "Peer %d sent us a GETBLOCKTXN for block %s, sending a BLOCKTXN with %u txns. (%u bytes)\n", pfrom.GetId(), block.GetHash().ToString(), resp.txn.size(), tx_requested_size);
     }
     MakeAndPushMessage(pfrom, NetMsgType::BLOCKTXN, resp);
+}
+
+//
+// Bridge (-bitcoinpeer): feed our mempool from Bitcoin's post-fork blocks.
+//
+// A Bitcoin peer's headers at or above the fork height cannot be validated as
+// our blocks, so they are tracked in the peer's ForeignChain instead of the
+// block index. The corresponding full blocks are fetched and every non-coinbase
+// transaction is offered to the mempool exactly as sendrawtransaction would: a
+// Bitcoin transaction that is still valid here propagates from this node,
+// anything else is rejected by ATMP. Bitcoin's transaction gossip is ignored.
+//
+
+fs::path PeerManagerImpl::BridgeAnchorPath() const
+{
+    return m_chainman.m_options.datadir / BRIDGE_ANCHOR_FILE;
+}
+
+void PeerManagerImpl::BridgeInitPeer(NodeId nodeid)
+{
+    AssertLockHeld(cs_main);
+    CNodeState* state{State(nodeid)};
+    state->m_foreign = std::make_unique<ForeignChain>();
+    if (!m_bridge_anchor_loaded) {
+        m_bridge_anchor_loaded = true;
+        // Legacy files may contain ancestry lines; only the first (the last fed block) is needed.
+        std::ifstream in{BridgeAnchorPath().std_path()};
+        std::string hash_hex;
+        int height{-1};
+        if (in >> hash_hex >> height) {
+            if (const auto hash{uint256::FromHex(hash_hex)}; hash && height >= 0) {
+                m_bridge_anchor = {*hash, height};
+                LogInfo("bridge: resuming after Bitcoin block %s (height %d)\n",
+                        m_bridge_anchor.first.ToString(), m_bridge_anchor.second);
+            }
+        }
+    }
+    if (m_bridge_anchor.second < 0) return;
+    ForeignChain& fc{*state->m_foreign};
+    ForeignChain::Entry entry;
+    entry.height = m_bridge_anchor.second;
+    entry.processed = true;
+    fc.entries.emplace(m_bridge_anchor.first, std::move(entry));
+    fc.by_height.emplace(m_bridge_anchor.second, m_bridge_anchor.first);
+    fc.tip = m_bridge_anchor.first;
+    fc.tip_height = m_bridge_anchor.second;
+}
+
+void PeerManagerImpl::BridgeSaveAnchor()
+{
+    AssertLockHeld(cs_main);
+    m_bridge_anchor_dirty = false;
+    const fs::path path{BridgeAnchorPath()};
+    const fs::path tmp{path + ".tmp"};
+    {
+        std::ofstream out{tmp.std_path(), std::ios::trunc};
+        out << m_bridge_anchor.first.ToString() << ' ' << m_bridge_anchor.second << '\n';
+        if (!out) {
+            LogWarning("bridge: cannot write %s\n", fs::PathToString(tmp));
+            return;
+        }
+    }
+    if (!RenameOver(tmp, path)) LogWarning("bridge: cannot rename %s\n", fs::PathToString(tmp));
+}
+
+CBlockLocator PeerManagerImpl::BridgeLocator(NodeId nodeid)
+{
+    AssertLockHeld(cs_main);
+    const int fork_height{BridgeForkHeight()};
+    std::vector<uint256> have;
+    if (const ForeignChain* fc{State(nodeid)->m_foreign.get()}; fc && fc->tip_height >= 0) {
+        // Same shape as LocatorEntries(): dense near the tip, then exponentially sparser.
+        int step{1};
+        auto it{fc->entries.find(fc->tip)};
+        while (it != fc->entries.end()) {
+            have.push_back(it->first);
+            if (have.size() > 10) step *= 2;
+            for (int i{0}; i < step && it != fc->entries.end(); ++i) it = fc->entries.find(it->second.prev);
+        }
+    }
+    if (m_bridge_anchor.second >= 0 && std::find(have.begin(), have.end(), m_bridge_anchor.first) == have.end()) {
+        have.push_back(m_bridge_anchor.first);
+    }
+    // Then our own chain: from the fork parent once we have it, otherwise (still syncing the
+    // pre-fork chain) from our best header as usual.
+    const CBlockIndex* base{m_chainman.m_best_header};
+    if (fork_height > 0 && m_chainman.ActiveChain().Height() >= fork_height - 1) {
+        base = m_chainman.ActiveChain()[fork_height - 1];
+    }
+    for (const uint256& hash : LocatorEntries(base)) have.push_back(hash);
+    return CBlockLocator{std::move(have)};
+}
+
+bool PeerManagerImpl::BridgeKnowsBlock(NodeId nodeid, const uint256& hash)
+{
+    AssertLockHeld(cs_main);
+    const ForeignChain* fc{State(nodeid)->m_foreign.get()};
+    return fc && fc->entries.count(hash) > 0;
+}
+
+std::vector<CBlockHeader> PeerManagerImpl::BridgeSplitHeaders(CNode& pfrom, Peer& peer, std::vector<CBlockHeader>&& headers)
+{
+    AssertLockHeld(g_msgproc_mutex);
+    const int fork_height{BridgeForkHeight()};
+    if (headers.empty() || fork_height <= 0) return std::move(headers);
+    {
+        // A low-work headers sync in progress (from-scratch bootstrap of the pre-fork chain) owns these.
+        LOCK(peer.m_headers_sync_mutex);
+        if (peer.m_headers_sync) return std::move(headers);
+    }
+    if (!CheckHeadersPoW(headers, peer)) return {};
+
+    LOCK(cs_main);
+    ForeignChain& fc{*Assert(State(pfrom.GetId())->m_foreign)};
+
+    // Height of the first header: its parent is either in our block index (the shared
+    // pre-fork chain, or the fork parent) or a foreign header we already hold.
+    int height{-1};
+    if (const CBlockIndex* prev{m_chainman.m_blockman.LookupBlockIndex(headers[0].hashPrevBlock)}) {
+        height = prev->nHeight + 1;
+        if (height > fork_height) {
+            // A Bitcoin peer cannot build on one of our post-fork blocks.
+            LogDebug(BCLog::NET, "bridge: ignoring header %s from peer=%d: builds on our post-fork block %s\n",
+                     headers[0].GetHash().ToString(), pfrom.GetId(), headers[0].hashPrevBlock.ToString());
+            return {};
+        }
+    } else if (const auto it{fc.entries.find(headers[0].hashPrevBlock)}; it != fc.entries.end()) {
+        height = it->second.height + 1;
+    } else {
+        // Does not connect: ask for what lies in between.
+        if (MaybeSendGetHeaders(pfrom, BridgeLocator(pfrom.GetId()), peer)) {
+            LogDebug(BCLog::NET, "bridge: header %s from peer=%d does not connect (prev %s), sending getheaders\n",
+                     headers[0].GetHash().ToString(), pfrom.GetId(), headers[0].hashPrevBlock.ToString());
+        }
+        return {};
+    }
+
+    // Everything below the fork height is the shared chain and is validated as usual.
+    const size_t n_pre{height < fork_height ? std::min(headers.size(), static_cast<size_t>(fork_height - height)) : 0};
+    size_t n_new{0};
+    for (size_t i{n_pre}; i < headers.size(); ++i) {
+        const CBlockHeader& header{headers[i]};
+        const uint256 hash{header.GetHash()};
+        const int h{height + static_cast<int>(i)};
+        if (fc.entries.count(hash) > 0) continue;
+        if (fc.entries.size() >= BRIDGE_MAX_FOREIGN_HEADERS) {
+            LogWarning("bridge: holding %u Bitcoin headers from peer=%d, not recording more until blocks are fed\n", fc.entries.size(), pfrom.GetId());
+            break;
+        }
+        ForeignChain::Entry entry;
+        entry.header = header;
+        entry.prev = header.hashPrevBlock;
+        entry.height = h;
+        // A block below the anchor but outside its remembered ancestry is a reorg and is fetched,
+        // unless another peer already fed it.
+        if (m_bridge_processed.count(hash) > 0) {
+            entry.processed = true;
+        } else {
+            fc.pending.emplace(h, hash);
+        }
+        fc.entries.emplace(hash, std::move(entry));
+        fc.by_height.emplace(h, hash);
+        // This trusted peer supplies its active chain. Moving the tip backwards here is how an
+        // offline reorg falls back from a persisted anchor to the fork parent and catches up again.
+        fc.tip = hash;
+        fc.tip_height = h;
+        ++n_new;
+    }
+    if (n_new > 0) {
+        LogDebug(BCLog::NET, "bridge: recorded %u Bitcoin header(s) from peer=%d, foreign tip %s (height %d), %u block(s) pending\n",
+                 n_new, pfrom.GetId(), fc.tip.ToString(), fc.tip_height, fc.pending.size());
+        // Forget processed headers well below the foreign tip; blocks are fetched oldest-first, so
+        // nothing down there is still pending.
+        for (auto it{fc.by_height.begin()}; it != fc.by_height.end() && it->first < fc.tip_height - BRIDGE_FOREIGN_KEEP_HEIGHTS;) {
+            const auto entry{fc.entries.find(it->second)};
+            if (entry != fc.entries.end() && entry->second.processed && it->second != m_bridge_anchor.first) {
+                fc.entries.erase(entry);
+                it = fc.by_height.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    if (headers.size() > n_pre) {
+        // These connected, so they answer any outstanding getheaders; a full batch may have more behind it.
+        peer.m_last_getheaders_timestamp = {};
+        if (headers.size() == m_opts.max_headers_result && MaybeSendGetHeaders(pfrom, BridgeLocator(pfrom.GetId()), peer)) {
+            LogDebug(BCLog::NET, "bridge: more getheaders to peer=%d (foreign tip height %d)\n", pfrom.GetId(), fc.tip_height);
+        }
+    }
+    headers.resize(n_pre);
+    return std::move(headers);
+}
+
+void PeerManagerImpl::BridgeRequestBlocks(CNode& node, Peer& peer, std::chrono::microseconds now)
+{
+    AssertLockHeld(g_msgproc_mutex);
+    AssertLockHeld(cs_main);
+    const int fork_height{BridgeForkHeight()};
+    if (fork_height <= 0) return;
+    // Until the fork parent is connected, our UTXO set cannot judge Bitcoin's post-fork transactions.
+    if (m_chainman.ActiveChain().Height() < fork_height - 1) return;
+    ForeignChain& fc{*Assert(State(node.GetId())->m_foreign)};
+
+    // Announcements normally keep us current; poll now and then in case one was missed.
+    if (now - fc.last_poll > BRIDGE_HEADERS_POLL_INTERVAL) {
+        fc.last_poll = now;
+        if (MaybeSendGetHeaders(node, BridgeLocator(node.GetId()), peer)) {
+            LogDebug(BCLog::NET, "bridge: polling peer=%d for headers past foreign tip height %d\n", node.GetId(), fc.tip_height);
+        }
+    }
+
+    if (fc.pending.empty()) return;
+    // One peer feeds at a time so blocks are fetched and offered strictly oldest-first. Another
+    // peer takes the slot when the feeder is gone, has nothing queued, or has not been served
+    // within BRIDGE_BLOCK_TIMEOUT.
+    if (m_bridge_feed_peer != node.GetId()) {
+        bool take_over{true};
+        if (const CNodeState* feeder{m_bridge_feed_peer == -1 ? nullptr : State(m_bridge_feed_peer)}; feeder && feeder->m_foreign && !feeder->m_foreign->pending.empty()) {
+            const ForeignChain& ffc{*feeder->m_foreign};
+            const ForeignChain::Entry& in_flight{ffc.entries.at(ffc.pending.begin()->second)};
+            take_over = in_flight.requested_at != 0us && now - in_flight.requested_at > BRIDGE_BLOCK_TIMEOUT;
+        }
+        if (!take_over) return;
+        LogInfo("bridge: peer=%d now feeds Bitcoin blocks (was peer=%d)\n", node.GetId(), m_bridge_feed_peer);
+        m_bridge_feed_peer = node.GetId();
+    }
+    const uint256 hash{fc.pending.begin()->second};
+    ForeignChain::Entry& entry{fc.entries.at(hash)};
+    if (entry.requested_at != 0us) {
+        if (now - entry.requested_at <= BRIDGE_BLOCK_TIMEOUT) return;
+        LogWarning("bridge: Bitcoin block %s (height %d) was not served by archival peer=%d; feed is stalled, retrying\n",
+                   hash.ToString(), entry.height, node.GetId());
+    } else {
+        LogDebug(BCLog::NET, "bridge: requesting Bitcoin block %s (height %d) from peer=%d\n", hash.ToString(), entry.height, node.GetId());
+    }
+    entry.requested_at = now;
+    MakeAndPushMessage(node, NetMsgType::GETDATA, std::vector<CInv>{{MSG_BLOCK | MSG_WITNESS_FLAG, hash}});
+}
+
+PeerManagerImpl::BridgeTxResult PeerManagerImpl::BridgeOfferTx(const CTransactionRef& tx, std::string& reason)
+{
+    AssertLockHeld(g_msgproc_mutex);
+    LOCK2(cs_main, m_tx_download_mutex);
+    const MempoolAcceptResult result{m_chainman.ProcessTransaction(tx, /*test_accept=*/false)};
+    switch (result.m_result_type) {
+    case MempoolAcceptResult::ResultType::VALID:
+        // As sendrawtransaction: announced to our peers and kept in the unbroadcast set.
+        m_mempool.AddUnbroadcastTx(tx->GetHash());
+        m_txdownloadman.MempoolAcceptedTx(tx);
+        InitiateTxBroadcastToAll(tx->GetHash(), tx->GetWitnessHash());
+        return BridgeTxResult::ACCEPTED;
+    case MempoolAcceptResult::ResultType::MEMPOOL_ENTRY:
+    case MempoolAcceptResult::ResultType::DIFFERENT_WITNESS:
+        return BridgeTxResult::KNOWN;
+    case MempoolAcceptResult::ResultType::INVALID:
+        break;
+    }
+    reason = result.m_state.GetRejectReason();
+    LogDebug(BCLog::MEMPOOL, "bridge: Bitcoin tx %s not accepted: %s\n", tx->GetHash().ToString(), result.m_state.ToString());
+    const TxValidationResult what{result.m_state.GetResult()};
+    if (what == TxValidationResult::TX_MISSING_INPUTS) {
+        // A child of a held transaction is held with it (parents precede children in the queue).
+        for (const CTxIn& in : tx->vin) {
+            if (m_bridge_held_txids.count(in.prevout.hash) > 0) {
+                reason = "parent-held";
+                return BridgeTxResult::HELD;
+            }
+        }
+        return BridgeTxResult::MISSING;
+    }
+    if (reason == "txn-already-in-mempool" || reason == "txn-already-known") return BridgeTxResult::KNOWN;
+    // May clear later: locktime or sequence not yet reached on our chain, ancestors still
+    // unconfirmed here, or mempool limits.
+    if (what == TxValidationResult::TX_PREMATURE_SPEND || reason == "too-long-mempool-chain" || reason == "mempool full" || reason == "mempool min fee not met") {
+        return BridgeTxResult::HELD;
+    }
+    return BridgeTxResult::OTHER;
+}
+
+void PeerManagerImpl::BridgeHoldTx(const CTransactionRef& tx, std::chrono::microseconds now)
+{
+    AssertLockHeld(g_msgproc_mutex);
+    if (m_bridge_held_txs.size() >= BRIDGE_HELD_TXS_MAX) {
+        m_bridge_held_txids.erase(m_bridge_held_txs.front().first->GetHash());
+        m_bridge_held_txs.pop_front();
+    }
+    m_bridge_held_txs.emplace_back(tx, now);
+    m_bridge_held_txids.insert(tx->GetHash());
+}
+
+void PeerManagerImpl::BridgeRetryHeldTxs(std::chrono::microseconds now)
+{
+    AssertLockHeld(g_msgproc_mutex);
+    if (m_bridge_held_txs.empty()) return;
+    const uint256 tip{WITH_LOCK(cs_main, return m_chainman.ActiveTip() ? m_chainman.ActiveTip()->GetBlockHash() : uint256{})};
+    if (tip == m_bridge_held_tip && now - m_bridge_held_retried_at < BRIDGE_HELD_TXS_RETRY_INTERVAL) return;
+    m_bridge_held_tip = tip;
+    m_bridge_held_retried_at = now;
+    int accepted{0}, dropped{0};
+    std::deque<std::pair<CTransactionRef, std::chrono::microseconds>> held;
+    for (const auto& [tx, since] : m_bridge_held_txs) {
+        std::string reason;
+        bool keep{false};
+        switch (BridgeOfferTx(tx, reason)) {
+        case BridgeTxResult::ACCEPTED:
+            ++accepted;
+            break;
+        case BridgeTxResult::HELD:
+            keep = now - since < BRIDGE_HELD_TXS_MAX_AGE;
+            if (!keep) ++dropped;
+            break;
+        case BridgeTxResult::KNOWN:
+        case BridgeTxResult::MISSING:
+        case BridgeTxResult::OTHER:
+            ++dropped;
+            break;
+        }
+        if (keep) {
+            held.emplace_back(tx, since);
+        } else {
+            m_bridge_held_txids.erase(tx->GetHash());
+        }
+    }
+    m_bridge_held_txs = std::move(held);
+    if (accepted + dropped > 0) {
+        LogInfo("bridge: re-offered held Bitcoin transactions: %d accepted, %d dropped, %u still held\n", accepted, dropped, m_bridge_held_txs.size());
+    }
+}
+
+bool PeerManagerImpl::BridgeProcessBlock(CNode& pfrom, Peer& peer, const std::shared_ptr<const CBlock>& block)
+{
+    AssertLockHeld(g_msgproc_mutex);
+    const uint256 hash{block->GetHash()};
+    const int fork_height{BridgeForkHeight()};
+    int height{-1};
+    {
+        LOCK(cs_main);
+        ForeignChain& fc{*Assert(State(pfrom.GetId())->m_foreign)};
+        const auto it{fc.entries.find(hash)};
+        if (it == fc.entries.end()) {
+            // Not a foreign block we asked for. Pre-fork blocks take the normal path; anything
+            // else from a Bitcoin peer must never reach ProcessNewBlock.
+            const CBlockIndex* prev{m_chainman.m_blockman.LookupBlockIndex(block->hashPrevBlock)};
+            if (fork_height <= 0 || (prev && prev->nHeight + 1 < fork_height)) return false;
+            LogDebug(BCLog::NET, "bridge: ignoring unrequested block %s from Bitcoin peer=%d\n", hash.ToString(), pfrom.GetId());
+            return true;
+        }
+        if (it->second.processed) {
+            it->second.requested_at = 0us;
+            return true;
+        }
+        if (fc.pending.empty() || fc.pending.begin()->second != hash || it->second.requested_at == 0us) {
+            LogDebug(BCLog::NET, "bridge: ignoring out-of-order or unrequested Bitcoin block %s from peer=%d\n",
+                     hash.ToString(), pfrom.GetId());
+            return true;
+        }
+        height = it->second.height;
+    }
+    // The block must match its header: merkle root and (segwit is active on post-fork Bitcoin) witness
+    // commitment. A mutated block stays in flight and is re-requested after BRIDGE_BLOCK_TIMEOUT.
+    if (block->vtx.empty() || !block->vtx.front()->IsCoinBase() ||
+        std::any_of(std::next(block->vtx.begin()), block->vtx.end(), [](const auto& tx) { return tx->IsCoinBase(); }) ||
+        IsBlockMutated(*block, /*check_witness_root=*/true)) {
+        LogDebug(BCLog::NET, "bridge: mutated Bitcoin block %s (height %d) from peer=%d\n", hash.ToString(), height, pfrom.GetId());
+        return true;
+    }
+
+    // Offer every transaction to the mempool in block order. Only the oldest pending block is
+    // requested, so block order is guaranteed without a response buffer.
+    const auto now{GetTime<std::chrono::microseconds>()};
+    int accepted{0}, known{0}, missing{0}, held{0}, other{0};
+    std::map<std::string, int> reasons;
+    for (size_t i{1}; i < block->vtx.size(); ++i) {
+        const CTransactionRef& tx{block->vtx[i]};
+        std::string reason;
+        switch (BridgeOfferTx(tx, reason)) {
+        case BridgeTxResult::ACCEPTED:
+            ++accepted;
+            break;
+        case BridgeTxResult::KNOWN:
+            ++known;
+            break;
+        case BridgeTxResult::MISSING:
+            ++missing;
+            break;
+        case BridgeTxResult::HELD:
+            ++held;
+            ++reasons[reason];
+            BridgeHoldTx(tx, now);
+            break;
+        case BridgeTxResult::OTHER:
+            ++other;
+            ++reasons[reason];
+            break;
+        }
+    }
+    std::string detail;
+    for (const auto& [reason, n] : reasons) detail += strprintf(" %s=%d", reason, n);
+    LogInfo("bridge: Bitcoin block %s (height %d, peer=%d): %u tx, %d accepted, %d already known, %d missing inputs, %d held, %d other%s\n",
+            hash.ToString(), height, pfrom.GetId(), block->vtx.size() - 1, accepted, known, missing, held, other, detail);
+
+    LOCK(cs_main);
+    BridgeMarkProcessed(pfrom.GetId(), hash);
+    if (m_bridge_anchor_dirty) BridgeSaveAnchor();
+    return true;
+}
+
+void PeerManagerImpl::BridgeMarkProcessed(NodeId nodeid, const uint256& hash)
+{
+    AssertLockHeld(cs_main);
+    if (!State(nodeid)->m_foreign || !State(nodeid)->m_foreign->entries.count(hash)) return;
+    // Every peer following this chain drops the block from its queue, so a takeover never re-feeds it.
+    int height{-1};
+    for (auto& [id, other] : m_node_states) {
+        if (!other.m_foreign) continue;
+        ForeignChain& fc{*other.m_foreign};
+        const auto it{fc.entries.find(hash)};
+        if (it == fc.entries.end()) continue;
+        ForeignChain::Entry& entry{it->second};
+        height = entry.height;
+        entry.processed = true;
+        entry.requested_at = 0us;
+        for (auto p{fc.pending.lower_bound(entry.height)}; p != fc.pending.end() && p->first == entry.height; ++p) {
+            if (p->second == hash) {
+                fc.pending.erase(p);
+                break;
+            }
+        }
+    }
+    if (m_bridge_processed.insert(hash).second) {
+        m_bridge_processed_order.push_back(hash);
+        if (m_bridge_processed_order.size() > static_cast<size_t>(BRIDGE_FOREIGN_KEEP_HEIGHTS)) {
+            m_bridge_processed.erase(m_bridge_processed_order.front());
+            m_bridge_processed_order.pop_front();
+        }
+    }
+    // Only the oldest pending block is ever requested, so everything below this height has already
+    // been fed and the anchor can simply follow the highest block processed.
+    if (height <= m_bridge_anchor.second) return;
+    m_bridge_anchor = {hash, height};
+    LogDebug(BCLog::NET, "bridge: anchor is now Bitcoin block %s (height %d)\n", m_bridge_anchor.first.ToString(), m_bridge_anchor.second);
+    m_bridge_anchor_dirty = true;
 }
 
 bool PeerManagerImpl::CheckHeadersPoW(const std::vector<CBlockHeader>& headers, Peer& peer)
@@ -3671,6 +4222,12 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
 
         pfrom.m_has_all_wanted_services = HasAllDesirableServiceFlags(nServices);
         peer.m_their_services = nServices;
+        if (BridgeFeeds(peer) && (!(nServices & NODE_NETWORK) || !(nServices & NODE_WITNESS))) {
+            LogWarning("bridge: Bitcoin peer=%d must be an unpruned witness full node (NODE_NETWORK|NODE_WITNESS required, services=%016x); disconnecting\n",
+                       pfrom.GetId(), uint64_t{nServices});
+            pfrom.fDisconnect = true;
+            return;
+        }
         pfrom.SetAddrLocal(addrMe);
         {
             LOCK(pfrom.m_subver_mutex);
@@ -3686,6 +4243,10 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         //   the peer may turn on transaction relay later.
         if (!pfrom.IsBlockOnlyConn() &&
             !pfrom.IsFeelerConn() &&
+            // Never announce our transactions to a Bitcoin peer, whatever fRelay
+            // they sent us: our transactions are stamped with the replay-protection
+            // nLockTime and belong on this chain only.
+            !pfrom.m_bitcoin_magic &&
             (fRelay || (peer.m_our_services & NODE_BLOOM))) {
             auto* const tx_relay = peer.SetTxRelay();
             {
@@ -4137,9 +4698,17 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
 
         const auto current_time{GetTime<std::chrono::microseconds>()};
         uint256* best_block{nullptr};
+        bool bridge_getheaders{false};
 
         for (CInv& inv : vInv) {
             if (interruptMsgProc) return;
+
+            if (BridgeFeeds(peer)) {
+                // Bridge: Bitcoin's transaction gossip is ignored (its blocks are the feed, see
+                // BridgeProcessBlock); a block announcement just prompts a headers request.
+                if (inv.IsMsgBlk() && !AlreadyHaveBlock(inv.hash) && !BridgeKnowsBlock(pfrom.GetId(), inv.hash)) bridge_getheaders = true;
+                continue;
+            }
 
             // Ignore INVs that don't match wtxidrelay setting.
             // Note that orphan parent fetching always uses MSG_TX GETDATAs regardless of the wtxidrelay setting.
@@ -4180,6 +4749,10 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             } else {
                 LogDebug(BCLog::NET, "Unknown inv type \"%s\" received from peer=%d\n", inv.ToString(), pfrom.GetId());
             }
+        }
+
+        if (bridge_getheaders && MaybeSendGetHeaders(pfrom, BridgeLocator(pfrom.GetId()), peer)) {
+            LogDebug(BCLog::NET, "bridge: getheaders to peer=%d after block inv\n", pfrom.GetId());
         }
 
         if (best_block != nullptr) {
@@ -4449,6 +5022,8 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         LogDebug(BCLog::NET, "getheaders %d to %s from peer=%d\n", (pindex ? pindex->nHeight : -1), hashStop.IsNull() ? "end" : hashStop.ToString(), pfrom.GetId());
         for (; pindex; pindex = m_chainman.ActiveChain().Next(pindex))
         {
+            // Bridge: our post-fork headers are not Bitcoin's; a Bitcoin peer only gets the shared chain.
+            if (BridgeFeeds(peer) && pindex->nHeight >= BridgeForkHeight()) break;
             vHeaders.emplace_back(pindex->GetBlockHeader());
             if (--nLimit <= 0 || pindex->GetBlockHash() == hashStop)
                 break;
@@ -4471,6 +5046,11 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
     }
 
     if (msg_type == NetMsgType::TX) {
+        if (BridgeFeeds(peer)) {
+            // Bridge: unsolicited Bitcoin transactions are not our feed; drop without penalty.
+            LogDebug(BCLog::NET, "bridge: ignoring tx message from Bitcoin peer=%d\n", pfrom.GetId());
+            return;
+        }
         if (RejectIncomingTxs(pfrom)) {
             LogDebug(BCLog::NET, "transaction sent in violation of protocol, %s", pfrom.DisconnectMsg(fLogIPs));
             pfrom.fDisconnect = true;
@@ -4561,6 +5141,13 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
 
         CBlockHeaderAndShortTxIDs cmpctblock;
         vRecv >> cmpctblock;
+
+        if (BridgeFeeds(peer)) {
+            // Bridge: a compact block from a Bitcoin peer is just a header announcement;
+            // post-fork blocks are fetched in full by BridgeRequestBlocks.
+            std::vector<CBlockHeader> announced{cmpctblock.header};
+            if (BridgeSplitHeaders(pfrom, peer, std::move(announced)).empty()) return;
+        }
 
         bool received_new_header = false;
         const auto blockhash = cmpctblock.header.GetHash();
@@ -4835,6 +5422,12 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             ReadCompactSize(vRecv); // ignore tx count; assume it is 0.
         }
 
+        if (BridgeFeeds(peer)) {
+            // Bridge: split off Bitcoin's post-fork headers; only the shared pre-fork part is ours to validate.
+            headers = BridgeSplitHeaders(pfrom, peer, std::move(headers));
+            if (headers.empty() && nCount > 0) return;
+        }
+
         ProcessHeadersMessage(pfrom, peer, std::move(headers), /*via_compact_block=*/false);
 
         // Check if the headers presync progress needs to be reported to validation.
@@ -4866,6 +5459,9 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         vRecv >> TX_WITH_WITNESS(*pblock);
 
         LogDebug(BCLog::NET, "received block %s peer=%d\n", pblock->GetHash().ToString(), pfrom.GetId());
+
+        // Bridge: a requested post-fork Bitcoin block feeds the mempool and never reaches ProcessNewBlock.
+        if (BridgeFeeds(peer) && BridgeProcessBlock(pfrom, peer, pblock)) return;
 
         const CBlockIndex* prev_block{WITH_LOCK(m_chainman.GetMutex(), return m_chainman.m_blockman.LookupBlockIndex(pblock->hashPrevBlock))};
 
@@ -5629,6 +6225,8 @@ void PeerManagerImpl::MaybeSendFeefilter(CNode& pto, Peer& peer, std::chrono::mi
 {
     if (m_opts.ignore_incoming_txs) return;
     if (pto.GetCommonVersion() < FEEFILTER_VERSION) return;
+    // Bridge: we asked a Bitcoin peer for no transaction relay at all.
+    if (BridgeFeeds(peer)) return;
     // peers with the forcerelay permission should not filter txs to us
     if (pto.HasPermission(NetPermissionFlags::ForceRelay)) return;
     // Don't send feefilter messages to outbound block-relay-only peers since they should never announce
@@ -5700,6 +6298,12 @@ bool PeerManagerImpl::SetupAddressRelay(const CNode& node, Peer& peer)
     // information of addr traffic to infer the link.
     if (node.IsBlockOnlyConn()) return false;
 
+    // Peers reached over Bitcoin's magic are on a different network. Relaying
+    // their addresses onwards would fill our addrman -- and, via further relay,
+    // every peer's addrman -- with nodes that cannot speak our protocol, and
+    // announcing our peers to them would leak our network into Bitcoin's.
+    if (node.m_bitcoin_magic) return false;
+
     if (!peer.m_addr_relay_enabled.exchange(true)) {
         // During version message processing (non-block-relay-only outbound peers)
         // or on first addr-related message we have received (inbound peers), initialize
@@ -5763,6 +6367,11 @@ bool PeerManagerImpl::SendMessages(CNode& node)
 
     MaybeSendSendHeaders(node, peer);
 
+    if (BridgeFeeds(peer)) {
+        // Held Bitcoin transactions may have become acceptable (our tip moved, their ancestors confirmed here).
+        BridgeRetryHeldTxs(current_time);
+    }
+
     {
         LOCK(cs_main);
 
@@ -5807,7 +6416,7 @@ bool PeerManagerImpl::SendMessages(CNode& node)
                    got back an empty response.  */
                 if (pindexStart->pprev)
                     pindexStart = pindexStart->pprev;
-                if (MaybeSendGetHeaders(node, GetLocator(pindexStart), peer)) {
+                if (MaybeSendGetHeaders(node, BridgeFeeds(peer) ? BridgeLocator(node.GetId()) : GetLocator(pindexStart), peer)) {
                     LogDebug(BCLog::NET, "initial getheaders (%d) to peer=%d (startheight:%d)\n", pindexStart->nHeight, node.GetId(), peer.m_starting_height);
 
                     state.fSyncStarted = true;
@@ -6157,6 +6766,9 @@ bool PeerManagerImpl::SendMessages(CNode& node)
         // Check that outbound peers have reasonable chains
         // GetTime() is used by this anti-DoS logic so we can test this using mocktime
         ConsiderEviction(node, peer, GetTime<std::chrono::seconds>());
+
+        // Bridge: fetch Bitcoin's post-fork blocks for their transactions.
+        if (state.m_foreign) BridgeRequestBlocks(node, peer, current_time);
 
         //
         // Message: getdata (blocks)

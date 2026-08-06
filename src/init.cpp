@@ -151,6 +151,8 @@ using util::ToString;
 
 static constexpr bool DEFAULT_PROXYRANDOMIZE{true};
 static constexpr bool DEFAULT_REST_ENABLE{false};
+/** Bridge: cap on -bitcoinpeer entries once the Bitcoin block feed is active. */
+static constexpr size_t MAX_BRIDGE_FEED_PEERS{4};
 static constexpr bool DEFAULT_I2P_ACCEPT_INCOMING{true};
 static constexpr bool DEFAULT_STOPAFTERBLOCKIMPORT{false};
 
@@ -537,6 +539,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
                  ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 
     argsman.AddArg("-addnode=<ip>", strprintf("Add a node to connect to and attempt to keep the connection open (see the addnode RPC help for more info). This option can be specified multiple times to add multiple nodes; connections are limited to %u at a time and are counted separately from the -maxconnections limit.", MAX_ADDNODE_CONNECTIONS), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-bitcoinpeer=<ip>", "Connect to an operator-controlled, unpruned Bitcoin full node using Bitcoin's network magic, to fetch the pre-fork chain and, past the fork, feed our mempool from Bitcoin blocks. The connection should use loopback or a trusted private network because Bitcoin P2P is not authenticated. Up to four peers may be given when the block feed is active: one fetches blocks at a time, the others follow headers and take over if it disconnects or stalls. Each peer must advertise NODE_NETWORK and NODE_WITNESS. Always v1; never relays addresses or transaction gossip. Seed-node use only.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-asmap=<file>", strprintf("Specify asn mapping used for bucketing of the peers. Relative paths will be prefixed by the net-specific datadir location.%s",
                 #ifdef ENABLE_EMBEDDED_ASMAP
                     " If a bool arg is given (-asmap or -asmap=1), the embedded mapping data in the binary will be used."
@@ -2105,6 +2108,10 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     connOptions.nSendBufferMaxSize = 1000 * args.GetIntArg("-maxsendbuffer", DEFAULT_MAXSENDBUFFER);
     connOptions.nReceiveFloodSize = 1000 * args.GetIntArg("-maxreceivebuffer", DEFAULT_MAXRECEIVEBUFFER);
     connOptions.m_added_nodes = args.GetArgs("-addnode");
+    connOptions.m_bitcoin_peers = args.GetArgs("-bitcoinpeer");
+    if (chainparams.GetConsensus().EcashHeight > 0 && connOptions.m_bitcoin_peers.size() > MAX_BRIDGE_FEED_PEERS) {
+        return InitError(strprintf(_("At most %u -bitcoinpeer entries may be specified when the Bitcoin block feed is active"), MAX_BRIDGE_FEED_PEERS));
+    }
     connOptions.nMaxOutboundLimit = *opt_max_upload;
     connOptions.m_peer_connect_timeout = peer_connect_timeout;
     connOptions.whitelist_forcerelay = args.GetBoolArg("-whitelistforcerelay", DEFAULT_WHITELISTFORCERELAY);

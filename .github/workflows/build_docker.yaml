@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - alphanet
+      - alphanet-bridge
   workflow_dispatch:
   pull_request:
 
@@ -43,6 +44,10 @@ jobs:
 
             # moving tag for the alphanet branch
             type=raw,value=alphanet,enable=${{ github.ref == 'refs/heads/alphanet' }}
+
+            # moving tag for the release branch, which builds the seed
+            # node that also speaks Bitcoin's network magic
+            type=raw,value=alphanet-bridge,enable=${{ github.ref == 'refs/heads/alphanet-bridge' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
