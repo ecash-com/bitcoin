@@ -199,7 +199,8 @@ enum opcodetype
     OP_CHECKSEQUENCEVERIFY = 0xb2,
     OP_NOP3 = OP_CHECKSEQUENCEVERIFY,
     OP_NOP4 = 0xb3,
-    OP_NOP5 = 0xb4,
+    OP_DRIVECHAIN = 0xb4,
+    OP_NOP5 = OP_DRIVECHAIN,
     OP_NOP6 = 0xb5,
     OP_NOP7 = 0xb6,
     OP_NOP8 = 0xb7,
@@ -542,6 +543,7 @@ public:
      */
     static bool IsPayToAnchor(int version, const std::vector<unsigned char>& program);
 
+    bool IsDrivechain() const;
     bool IsPayToScriptHash() const;
     bool IsPayToWitnessScriptHash() const;
     bool IsWitnessProgram(int& version, std::vector<unsigned char>& program) const;
