@@ -40,6 +40,7 @@
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <random.h>
+#include <repo_txns.h>
 #include <script/script.h>
 #include <script/sigcache.h>
 #include <signet.h>
@@ -2041,6 +2042,8 @@ ValidationCache::ValidationCache(const size_t script_execution_cache_bytes, cons
 /**
  * Check whether all of this transaction's input scripts succeed.
  *
+ * Skip inputs created by the set of eCash repurpose transactions.
+ *
  * This involves ECDSA signature checks so can be computationally intensive. This function should
  * only be called after the cheap sanity checks in CheckTxInputs passed.
  *
@@ -2064,6 +2067,8 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        std::vector<CScriptCheck>* pvChecks)
 {
     if (tx.IsCoinBase()) return true;
+
+    if (setRepurposeTx.count(tx.GetHash().ToUint256())) return true;
 
     if (pvChecks) {
         pvChecks->reserve(tx.vin.size());
