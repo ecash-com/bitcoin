@@ -146,11 +146,11 @@ public:
          * The characters are rarely used upper ASCII, not valid as UTF-8, and produce
          * a large 32-bit integer with any alignment.
          */
-        pchMessageStart[0] = 0xf9;
-        pchMessageStart[1] = 0xbe;
-        pchMessageStart[2] = 0xb4;
-        pchMessageStart[3] = 0xd9;
-        nDefaultPort = 8333;
+        pchMessageStart[0] = 0xec;
+        pchMessageStart[1] = 0xa5;
+        pchMessageStart[2] = 0xdc;
+        pchMessageStart[3] = 0xb7;
+        nDefaultPort = 8533;
         nPruneAfterHeight = 100000;
         m_assumed_blockchain_size = 897;
         m_assumed_chain_state_size = 14;
@@ -271,11 +271,11 @@ public:
         consensus.nMinimumChainWork = uint256{"0000000000000000000000000000000000000000000017f49f702147f10c0eb6"};
         consensus.defaultAssumeValid = uint256{"00000000b318a3703d14a844c55ef507f4c2fc8f8766e24271fd43c180c51637"}; // 5128859
 
-        pchMessageStart[0] = 0x0b;
-        pchMessageStart[1] = 0x11;
-        pchMessageStart[2] = 0x09;
-        pchMessageStart[3] = 0x07;
-        nDefaultPort = 18333;
+        pchMessageStart[0] = 0xec;
+        pchMessageStart[1] = 0xa5;
+        pchMessageStart[2] = 0xb1;
+        pchMessageStart[3] = 0x14;
+        nDefaultPort = 18533;
         nPruneAfterHeight = 1000;
         m_assumed_blockchain_size = 245;
         m_assumed_chain_state_size = 19;
@@ -378,11 +378,11 @@ public:
         consensus.nMinimumChainWork = uint256{"000000000000000000000000000000000000000000000e346a558455ade8eca9"};
         consensus.defaultAssumeValid = uint256{"0000000021df65b91665a342e26ceb05e54826ad7d8fcd40316230058fa3b865"}; // 151604
 
-        pchMessageStart[0] = 0x1c;
-        pchMessageStart[1] = 0x16;
-        pchMessageStart[2] = 0x3f;
-        pchMessageStart[3] = 0x28;
-        nDefaultPort = 48333;
+        pchMessageStart[0] = 0xec;
+        pchMessageStart[1] = 0xa5;
+        pchMessageStart[2] = 0xb1;
+        pchMessageStart[3] = 0x24;
+        nDefaultPort = 48533;
         nPruneAfterHeight = 1000;
         m_assumed_blockchain_size = 31;
         m_assumed_chain_state_size = 2;
@@ -526,13 +526,15 @@ public:
 
         ApplyDeploymentOptions(options.dep_opts);
 
-        // message start is defined as the first 4 bytes of the sha256d of the block script
+        // message start is defined as the first 4 bytes of the sha256d of the block
+        // script, tagged so that a signet cannot collide with the Bitcoin signet
+        // sharing its challenge
         HashWriter h{};
-        h << consensus.signet_challenge;
+        h << std::string{"ecash"} << consensus.signet_challenge;
         uint256 hash = h.GetHash();
         std::copy_n(hash.begin(), 4, pchMessageStart.begin());
 
-        nDefaultPort = 38333;
+        nDefaultPort = 38533;
         nPruneAfterHeight = 1000;
 
         genesis = CreateGenesisBlock(1598918400, 52613770, 0x1e0377ae, 1, 50 * COIN);
@@ -617,11 +619,11 @@ public:
         consensus.nMinimumChainWork = uint256{};
         consensus.defaultAssumeValid = uint256{};
 
-        pchMessageStart[0] = 0xfa;
-        pchMessageStart[1] = 0xbf;
-        pchMessageStart[2] = 0xb5;
-        pchMessageStart[3] = 0xda;
-        nDefaultPort = 18444;
+        pchMessageStart[0] = 0xec;
+        pchMessageStart[1] = 0xa5;
+        pchMessageStart[2] = 0xb1;
+        pchMessageStart[3] = 0x34;
+        nDefaultPort = 18644;
         nPruneAfterHeight = opts.fastprune ? 100 : 1000;
         m_assumed_blockchain_size = 0;
         m_assumed_chain_state_size = 0;
