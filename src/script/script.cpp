@@ -221,6 +221,11 @@ bool CScript::IsPayToAnchor(int version, const std::vector<unsigned char>& progr
         program[1] == 0x73;
 }
 
+bool CScript::IsDrivechain() const
+{
+    return (this->size() == 4 && (*this)[0] == OP_DRIVECHAIN);
+}
+
 bool CScript::IsPayToScriptHash() const
 {
     // Extra-fast test for pay-to-script-hash CScripts:

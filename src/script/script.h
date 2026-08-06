@@ -203,7 +203,8 @@ enum opcodetype
     OP_NOP5 = 0xb4,
     OP_NOP6 = 0xb5,
     OP_NOP7 = 0xb6,
-    OP_NOP8 = 0xb7,
+    OP_DRIVECHAIN = 0xb7,
+    OP_NOP8 = OP_DRIVECHAIN,
     OP_NOP9 = 0xb8,
     OP_NOP10 = 0xb9,
 
@@ -543,6 +544,7 @@ public:
      */
     static bool IsPayToAnchor(int version, const std::vector<unsigned char>& program);
 
+    bool IsDrivechain() const;
     bool IsPayToScriptHash() const;
     bool IsPayToWitnessScriptHash() const;
     bool IsWitnessProgram(int& version, std::vector<unsigned char>& program) const;

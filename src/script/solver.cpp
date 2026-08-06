@@ -29,6 +29,7 @@ std::string GetTxnOutputType(TxoutType t)
     case TxoutType::WITNESS_V0_SCRIPTHASH: return "witness_v0_scripthash";
     case TxoutType::WITNESS_V1_TAPROOT: return "witness_v1_taproot";
     case TxoutType::WITNESS_UNKNOWN: return "witness_unknown";
+    case TxoutType::DRIVECHAIN: return "drivechain";
     } // no default case, so the compiler can warn about missing cases
     assert(false);
 }
@@ -141,6 +142,11 @@ std::optional<std::pair<int, std::vector<std::span<const unsigned char>>>> Match
 TxoutType Solver(const CScript& scriptPubKey, std::vector<std::vector<unsigned char>>& vSolutionsRet)
 {
     vSolutionsRet.clear();
+
+    // Shortcut for OP_DRIVECHAIN scripts
+    if (scriptPubKey.IsDrivechain()) {
+        return TxoutType::DRIVECHAIN;
+    }
 
     // Shortcut for pay-to-script-hash, which are more constrained than the other types:
     // it is always OP_HASH160 20 [20 byte hash] OP_EQUAL
