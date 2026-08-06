@@ -1,0 +1,351 @@
+name: Build and Release
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+env:
+  RELEASE_TAG_REGEX: '^ecash-v[0-9]+\.[0-9]+\.[0-9]+-core[0-9]+\.[0-9]+(\.[0-9]+)?$'
+  RELEASE_CHANNEL: mainnet
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check-release:
+    name: Check if release upload needed
+    runs-on: ubuntu-latest
+    outputs:
+      should-upload: ${{ steps.check.outputs.should-upload }}
+      channel: ${{ steps.check.outputs.channel }}
+      release: ${{ steps.check.outputs.release }}
+    steps:
+      - name: Check tag against release pattern
+        id: check
+        # Ref names are attacker-influenced; keep ${{ }} out of the script body.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          echo "Event: $EVENT_NAME"
+          echo "Repository owner: $REPO_OWNER"
+          echo "Ref: $REF_TYPE $REF_NAME"
+
+          skip() {
+            echo "::notice::Skipping upload: $1"
+            echo "should-upload=false" >> "$GITHUB_OUTPUT"
+            echo "channel=" >> "$GITHUB_OUTPUT"
+            echo "release=" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          [ "$EVENT_NAME" = "push" ]     || skip "not a push event"
+          [ "$REPO_OWNER" = "ecash-com" ] || skip "not the ecash-com repo"
+          [ "$REF_TYPE" = "tag" ]         || skip "not a tag push"
+
+          # Strict match; the tag ends up in release.json.
+          printf '%s\n' "$REF_NAME" | grep -Eq "$RELEASE_TAG_REGEX" \
+            || skip "tag '$REF_NAME' does not match $RELEASE_TAG_REGEX"
+
+          echo "::notice::Will publish: tag '$REF_NAME' to channel '$RELEASE_CHANNEL'"
+          echo "should-upload=true" >> "$GITHUB_OUTPUT"
+          echo "channel=$RELEASE_CHANNEL" >> "$GITHUB_OUTPUT"
+          # ecash-v1.2.0-core32.1 -> 1.2.0-core32.1: the published directory and zip version.
+          echo "release=${REF_NAME#ecash-v}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.artifact-suffix }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-24.04
+            timeout: 120
+            artifact-suffix: x86_64-unknown-linux-gnu
+            exe-ext: ""
+            build-subdir: ""
+          - platform: windows
+            os: windows-2025-vs2026
+            timeout: 360
+            artifact-suffix: x86_64-w64-msvc
+            exe-ext: ".exe"
+            build-subdir: "Release/"
+          - platform: macos
+            os: macos-15-intel
+            timeout: 120
+            artifact-suffix: x86_64-apple-darwin
+            exe-ext: ""
+            build-subdir: ""
+          - platform: macos
+            os: macos-15
+            timeout: 120
+            artifact-suffix: aarch64-apple-darwin
+            exe-ext: ""
+            build-subdir: ""
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      # Set branch suffix for artifact names (empty on master, branch name otherwise)
+      - name: Set artifact branch suffix
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$REF" = "refs/heads/master" ]; then
+            echo "BRANCH_SUFFIX=" >> "$GITHUB_ENV"
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            # Sanitize branch name (replace / with -)
+            BRANCH=$(echo "$HEAD_REF" | sed 's/\//-/g')
+            echo "BRANCH_SUFFIX=-${BRANCH}" >> "$GITHUB_ENV"
+          else
+            # Push to non-master branch
+            BRANCH=$(echo "$REF_NAME" | sed 's/\//-/g')
+            echo "BRANCH_SUFFIX=-${BRANCH}" >> "$GITHUB_ENV"
+          fi
+
+      #
+      # Platform-specific setup
+      #
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        # Host tools for building the depends tree, see depends/README.md
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake curl bison \
+              ninja-build pkgconf python3 xz-utils
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
+      - name: Install macOS dependencies
+        if: matrix.platform == 'macos'
+        run: |
+          # GNU grep is required, as BSD grep does not support perl regexes
+          # GNU make is required, as macOS ships with GNU Make 3.81 which
+          # mishandles -j flags in MAKEFLAGS, breaking the depends Qt build
+          brew install --quiet cmake grep make ninja
+
+      - name: Import Visual Studio env vars
+        if: matrix.platform == 'windows'
+        run: py -3 .github/ci-windows.py standard github_import_vs_env
+
+      - name: Get Windows tool information
+        if: matrix.platform == 'windows'
+        run: |
+          set -o errexit -o pipefail -o xtrace -o nounset
+
+          cmake -version | tee cmake_version
+          echo '---'
+          msbuild.exe -version | tee msbuild_version
+          echo "${VCToolsVersion-}" | tee toolset_version
+          py -3 --version
+          bash --version
+
+      - name: Configure vcpkg for Windows
+        if: matrix.platform == 'windows'
+        run: |
+          echo "set(VCPKG_BUILD_TYPE release)" >> "${VCPKG_INSTALLATION_ROOT}/triplets/x64-windows.cmake"
+          echo "set(VCPKG_BUILD_TYPE release)" >> "${VCPKG_INSTALLATION_ROOT}/triplets/x64-windows-static.cmake"
+          # Workaround for libevent, which requires CMake 3.1 but is incompatible with CMake >= 4.0.
+          sed -i '1s/^/set(ENV{CMAKE_POLICY_VERSION_MINIMUM} 3.5)\n/' "${VCPKG_INSTALLATION_ROOT}/scripts/ports.cmake"
+          echo "VCPKG_ROOT=${VCPKG_INSTALLATION_ROOT}" >> "$GITHUB_ENV"
+
+      #
+      # Cache handling
+      #
+      - name: Restore depends cache (Linux/macOS)
+        if: matrix.platform != 'windows'
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ./depends
+          key: ${{ matrix.artifact-suffix }}-${{ hashFiles('depends/packages/**') }}
+
+      - name: Restore vcpkg tools cache (Windows)
+        if: matrix.platform == 'windows'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: C:/vcpkg/downloads/tools
+          key: ${{ github.job }}-vcpkg-tools
+
+      - name: Restore vcpkg binary cache (Windows)
+        if: matrix.platform == 'windows'
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        id: vcpkg-binary-cache
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: ${{ github.job }}-vcpkg-binary-${{ hashFiles('cmake_version', 'msbuild_version', 'toolset_version', 'vcpkg.json') }}
+
+      #
+      # Build dependencies (Linux/macOS only - Windows uses vcpkg)
+      #
+      - name: Download dependencies (Linux)
+        if: matrix.platform == 'linux'
+        run: make -C ./depends download-linux
+
+      - name: Download dependencies (macOS)
+        if: matrix.platform == 'macos'
+        run: gmake -C ./depends download-osx
+
+      - name: Build dependencies (Linux)
+        if: matrix.platform == 'linux'
+        run: make -C ./depends -j4
+
+      - name: Build dependencies (macOS)
+        if: matrix.platform == 'macos'
+        run: gmake -C ./depends -j4
+
+      - name: Save depends cache (Linux/macOS)
+        if: matrix.platform != 'windows'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ./depends
+          key: ${{ matrix.artifact-suffix }}-${{ hashFiles('depends/packages/**') }}
+
+      #
+      # Configure and build
+      #
+      - name: Configure build (Linux)
+        if: matrix.platform == 'linux'
+        run: cmake -B build --toolchain depends/x86_64-pc-linux-gnu/toolchain.cmake
+
+      - name: Configure build (macOS)
+        if: matrix.platform == 'macos'
+        run: cmake -B build -DBUILD_GUI=ON --toolchain depends/*-apple-darwin*/toolchain.cmake
+
+      - name: Configure build (Windows)
+        if: matrix.platform == 'windows'
+        run: |
+          cmake -B build --preset vs2026-static \
+            -DBUILD_GUI=ON -DWITH_ZMQ=ON \
+            -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF -DBUILD_TESTS=OFF -DBUILD_UTIL=ON
+
+      - name: Save vcpkg binary cache (Windows)
+        if: matrix.platform == 'windows' && github.event_name != 'pull_request' && steps.vcpkg-binary-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: ${{ github.job }}-vcpkg-binary-${{ hashFiles('cmake_version', 'msbuild_version', 'toolset_version', 'vcpkg.json') }}
+
+      - name: Build (Linux/macOS)
+        if: matrix.platform != 'windows'
+        run: cmake --build build -j4
+
+      - name: Build (Windows)
+        if: matrix.platform == 'windows'
+        run: cmake --build build -j "$NUMBER_OF_PROCESSORS" --config Release
+
+      #
+      # Extract version and prepare artifacts
+      #
+      - name: Set version environment variable
+        run: |
+          if [ "${{ matrix.platform }}" == "macos" ]; then
+            VERSION=$(ggrep -oP "(?<=^CMAKE_PROJECT_VERSION:STATIC=).+(?=)" build/CMakeCache.txt)
+          else
+            VERSION=$(grep -oP "(?<=^CMAKE_PROJECT_VERSION:STATIC=).+(?=$)" build/CMakeCache.txt || \
+                      grep CMAKE_PROJECT_VERSION:STATIC build/CMakeCache.txt | cut -d= -f2)
+          fi
+          echo "ECASH_BITCOIN_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Prepare artifacts
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          mkdir -p artifacts/qt
+          mv "build/bin/${{ matrix.build-subdir }}bitcoind${{ matrix.exe-ext }}" artifacts/
+          mv "build/bin/${{ matrix.build-subdir }}bitcoin-cli${{ matrix.exe-ext }}" artifacts/
+          mv "build/bin/${{ matrix.build-subdir }}bitcoin-util${{ matrix.exe-ext }}" artifacts/
+          mv "build/bin/${{ matrix.build-subdir }}bitcoin-qt${{ matrix.exe-ext }}" artifacts/qt/
+          # Read by the publisher: names the zips. <eCash version>-core<Bitcoin Core version>,
+          # the tag without its ecash-v prefix (32.1.0 -> 32.1).
+          ecash_v=$(grep -E '^set\(ECASH_VERSION_(MAJOR|MINOR|BUILD) ' CMakeLists.txt | tr -dc '0-9\n' | paste -sd. -)
+          release="${ecash_v}-core${ECASH_BITCOIN_VERSION%.0}"
+          # Tag, CMakeLists.txt and the user agent must agree on what this is.
+          if [ "$REF_TYPE" = "tag" ] && [ "ecash-v${release}" != "$REF_NAME" ]; then
+            echo "::error::Tag ${REF_NAME} does not match the source version ecash-v${release} (ECASH_VERSION_* / CLIENT_VERSION_* in CMakeLists.txt)"
+            exit 1
+          fi
+          printf '%s\n' "$release" > artifacts/VERSION
+
+      # Same recipe as contrib/devtools/split-debug.sh: debug info moves to a
+      # <name>.dbg beside the binary and is kept as a CI artifact, not published.
+      - name: Strip binaries (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          set -euo pipefail
+          mkdir -p debug
+          for bin in artifacts/bitcoind artifacts/bitcoin-cli artifacts/bitcoin-util artifacts/qt/bitcoin-qt; do
+            dbg="debug/$(basename "$bin").dbg"
+            objcopy --enable-deterministic-archives -p --only-keep-debug "$bin" "$dbg"
+            objcopy --enable-deterministic-archives -p --strip-debug "$bin"
+            strip --enable-deterministic-archives -p -s "$bin"
+            objcopy --enable-deterministic-archives -p --add-gnu-debuglink="$dbg" "$bin"
+          done
+          ls -l artifacts artifacts/qt debug
+
+      # Apple's strip re-applies the ad-hoc signature, so the result still runs
+      # on Apple Silicon. Debug info already lives outside the binary on macOS.
+      - name: Strip binaries (macOS)
+        if: matrix.platform == 'macos'
+        run: strip artifacts/bitcoind artifacts/bitcoin-cli artifacts/bitcoin-util artifacts/qt/bitcoin-qt
+
+      - name: Upload debug symbols (Linux)
+        if: matrix.platform == 'linux'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: debug-symbols-${{ env.ECASH_BITCOIN_VERSION }}${{ env.BRANCH_SUFFIX }}-${{ matrix.artifact-suffix }}
+          if-no-files-found: error
+          path: debug/*.dbg
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ecash-bitcoin-${{ env.ECASH_BITCOIN_VERSION }}${{ env.BRANCH_SUFFIX }}-${{ matrix.artifact-suffix }}
+          if-no-files-found: error
+          path: |
+            artifacts/VERSION
+            artifacts/bitcoind${{ matrix.exe-ext }}
+            artifacts/bitcoin-cli${{ matrix.exe-ext }}
+            artifacts/bitcoin-util${{ matrix.exe-ext }}
+            artifacts/qt/bitcoin-qt${{ matrix.exe-ext }}
+
+  publish:
+    name: Publish to releases.ecash.com
+    needs: [check-release, build]
+    if: needs.check-release.outputs.should-upload == 'true'
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ecash-com/releases/.github/workflows/publish.yml@a00ddba7a20020ef0a80219c9f63c6b1a8ddfd74
+    with:
+      project: L1-ecash-bitcoin
+      channel: ${{ needs.check-release.outputs.channel }}
+      release-id: ${{ needs.check-release.outputs.release }}
+      zip-naming: versioned
+      artifact-pattern: ecash-bitcoin-*
+      targets: |
+        x86_64-unknown-linux-gnu
+        x86_64-w64-msvc
+        x86_64-apple-darwin
+        aarch64-apple-darwin
+    secrets:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
