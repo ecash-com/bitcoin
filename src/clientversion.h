@@ -30,6 +30,12 @@ inline constexpr int CLIENT_VERSION =
 
 extern const std::string UA_NAME;
 
+/** eCash release version, in the same encoding as CLIENT_VERSION (which is the Bitcoin Core version). */
+inline constexpr int ECASH_VERSION =
+                             10000 * ECASH_VERSION_MAJOR
+                         +     100 * ECASH_VERSION_MINOR
+                         +       1 * ECASH_VERSION_BUILD;
+
 
 std::string FormatFullVersion();
 std::string FormatSubVersion(const std::string& name, int nClientVersion, const std::vector<std::string>& comments);

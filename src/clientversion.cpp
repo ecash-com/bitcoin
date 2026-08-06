@@ -19,7 +19,7 @@ using util::Join;
  * for both bitcoind and bitcoin-qt, to make it harder for attackers to
  * target servers or GUI users specifically.
  */
-const std::string UA_NAME("Satoshi");
+const std::string UA_NAME("eCash Satoshi");
 
 
 #include <bitcoin-build-info.h> // IWYU pragma: keep
@@ -36,7 +36,7 @@ const std::string UA_NAME("Satoshi");
     #define BUILD_DESC BUILD_GIT_TAG
     #define BUILD_SUFFIX ""
 #else
-    #define BUILD_DESC "v" CLIENT_VERSION_STRING
+    #define BUILD_DESC "v" ECASH_VERSION_STRING " (Bitcoin Core v" CLIENT_VERSION_STRING ")"
     #if CLIENT_VERSION_IS_RELEASE
         #define BUILD_SUFFIX ""
     #elif defined(BUILD_GIT_COMMIT)

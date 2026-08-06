@@ -5,6 +5,12 @@
 #ifndef BITCOIN_CONFIG_H
 #define BITCOIN_CONFIG_H
 
+/* eCash release version (not the Bitcoin Core version it is based on) */
+#define ECASH_VERSION_MAJOR @ECASH_VERSION_MAJOR@
+#define ECASH_VERSION_MINOR @ECASH_VERSION_MINOR@
+#define ECASH_VERSION_BUILD @ECASH_VERSION_BUILD@
+#define ECASH_VERSION_STRING "@ECASH_VERSION_STRING@"
+
 /* Version Build */
 #define CLIENT_VERSION_BUILD @CLIENT_VERSION_BUILD@
 

@@ -26,7 +26,14 @@ get_directory_property(precious_variables CACHE_VARIABLES)
 #=============================
 # Project / Package metadata
 #=============================
-set(CLIENT_NAME "Bitcoin Core")
+set(CLIENT_NAME "eCash")
+# eCash release version. Released as tag ecash-v<ECASH_VERSION>-core<Bitcoin Core version>
+set(ECASH_VERSION_MAJOR 1)
+set(ECASH_VERSION_MINOR 2)
+set(ECASH_VERSION_BUILD 0)
+set(ECASH_VERSION_STRING "${ECASH_VERSION_MAJOR}.${ECASH_VERSION_MINOR}.${ECASH_VERSION_BUILD}")
+
+# The Bitcoin Core version this tree is based on.
 set(CLIENT_VERSION_MAJOR 32)
 set(CLIENT_VERSION_MINOR 1)
 set(CLIENT_VERSION_BUILD 0)
