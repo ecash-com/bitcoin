@@ -79,6 +79,7 @@ class CMainParams : public CChainParams {
 public:
     CMainParams() {
         m_chain_type = ChainType::MAIN;
+        consensus.EcashHeight = 963648; // Retarget boundary, 2016 * 478
         consensus.signet_blocks = false;
         consensus.signet_challenge.clear();
         consensus.nSubsidyHalvingInterval = 210000;

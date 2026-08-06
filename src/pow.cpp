@@ -78,6 +78,10 @@ unsigned int CalculateNextWorkRequired(const CBlockIndex* pindexLast, int64_t nF
     bnNew *= nActualTimespan;
     bnNew /= params.nPowTargetTimespan;
 
+    // eCash fork activation difficulty reset
+    if (pindexLast->nHeight + 1 == params.EcashHeight)
+        bnNew = bnPowLimit;
+
     if (bnNew > bnPowLimit)
         bnNew = bnPowLimit;
 
