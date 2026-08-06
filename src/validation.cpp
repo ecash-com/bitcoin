@@ -4096,6 +4096,15 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
     if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-diffbits", "incorrect proof of work");
 
+    // Enforce eCash fork difficulty reset
+    if (nHeight == consensusParams.EcashHeight) {
+        if (block.nBits != consensusParams.EcashForkBits) {
+            LogInfo("%s: Invalid diffbits for eCash DA at height: %u.\n", __func__, nHeight);
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-diffbits-ecash-da", "Bits invalid for eCash DA height block!");
+        }
+        LogInfo("%s: eCash fork birthday DA activated! Height: %u\n", __func__, nHeight);
+    }
+
     // Check timestamp against prev
     if (block.GetBlockTime() <= pindexPrev->GetMedianTimePast())
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "time-too-old", "block's timestamp is too early");
