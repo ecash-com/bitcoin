@@ -1,0 +1,590 @@
+name: Build and Release
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+env:
+  # Branches whose pushes get published to releases.ecash.com.
+  RELEASE_BRANCHES: |
+    alphanet
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check-release:
+    name: Check if release upload needed
+    runs-on: ubuntu-latest
+    outputs:
+      should-upload: ${{ steps.check.outputs.should-upload }}
+      channel: ${{ steps.check.outputs.channel }}
+    steps:
+      - name: Check branch against release list
+        id: check
+        # Branch names are attacker-influenced; keep ${{ }} out of the script body.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          echo "Event: $EVENT_NAME"
+          echo "Repository owner: $REPO_OWNER"
+          echo "Branch: $REF_NAME"
+
+          skip() {
+            echo "::notice::Skipping upload: $1"
+            echo "should-upload=false" >> "$GITHUB_OUTPUT"
+            echo "channel=" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          [ "$EVENT_NAME" = "push" ]     || skip "not a push event"
+          [ "$REPO_OWNER" = "ecash-com" ] || skip "not the ecash-com repo"
+
+          # Becomes a public URL path component; reject rather than sanitize.
+          case "$REF_NAME" in
+            *[!A-Za-z0-9._-]* | "" | .* ) skip "branch '$REF_NAME' is not a safe path component" ;;
+          esac
+
+          echo "$RELEASE_BRANCHES" | grep -qxF "$REF_NAME" \
+            || skip "branch '$REF_NAME' not in release list"
+
+          echo "::notice::Will publish: branch '$REF_NAME' is in the release list"
+          echo "should-upload=true" >> "$GITHUB_OUTPUT"
+          echo "channel=$REF_NAME" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.artifact-suffix }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-24.04
+            timeout: 120
+            artifact-suffix: x86_64-unknown-linux-gnu
+            exe-ext: ""
+            build-subdir: ""
+          - platform: windows
+            os: windows-2025-vs2026
+            timeout: 360
+            artifact-suffix: x86_64-w64-msvc
+            exe-ext: ".exe"
+            build-subdir: "Release/"
+          - platform: macos
+            os: macos-15-intel
+            timeout: 120
+            artifact-suffix: x86_64-apple-darwin
+            exe-ext: ""
+            build-subdir: ""
+          - platform: macos
+            os: macos-15
+            timeout: 120
+            artifact-suffix: aarch64-apple-darwin
+            exe-ext: ""
+            build-subdir: ""
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      # Set branch suffix for artifact names (empty on master, branch name otherwise)
+      - name: Set artifact branch suffix
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$REF" = "refs/heads/master" ]; then
+            echo "BRANCH_SUFFIX=" >> "$GITHUB_ENV"
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            # Sanitize branch name (replace / with -)
+            BRANCH=$(echo "$HEAD_REF" | sed 's/\//-/g')
+            echo "BRANCH_SUFFIX=-${BRANCH}" >> "$GITHUB_ENV"
+          else
+            # Push to non-master branch
+            BRANCH=$(echo "$REF_NAME" | sed 's/\//-/g')
+            echo "BRANCH_SUFFIX=-${BRANCH}" >> "$GITHUB_ENV"
+          fi
+
+      #
+      # Platform-specific setup
+      #
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        # Host tools for building the depends tree, see depends/README.md
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake curl bison \
+              ninja-build pkgconf python3 xz-utils
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
+      - name: Install macOS dependencies
+        if: matrix.platform == 'macos'
+        run: |
+          # GNU grep is required, as BSD grep does not support perl regexes
+          # GNU make is required, as macOS ships with GNU Make 3.81 which
+          # mishandles -j flags in MAKEFLAGS, breaking the depends Qt build
+          brew install --quiet cmake grep make ninja
+
+      - name: Import Visual Studio env vars
+        if: matrix.platform == 'windows'
+        run: py -3 .github/ci-windows.py standard github_import_vs_env
+
+      - name: Get Windows tool information
+        if: matrix.platform == 'windows'
+        run: |
+          set -o errexit -o pipefail -o xtrace -o nounset
+
+          cmake -version | tee cmake_version
+          echo '---'
+          msbuild.exe -version | tee msbuild_version
+          echo "${VCToolsVersion-}" | tee toolset_version
+          py -3 --version
+          bash --version
+
+      - name: Configure vcpkg for Windows
+        if: matrix.platform == 'windows'
+        run: |
+          echo "set(VCPKG_BUILD_TYPE release)" >> "${VCPKG_INSTALLATION_ROOT}/triplets/x64-windows.cmake"
+          echo "set(VCPKG_BUILD_TYPE release)" >> "${VCPKG_INSTALLATION_ROOT}/triplets/x64-windows-static.cmake"
+          # Workaround for libevent, which requires CMake 3.1 but is incompatible with CMake >= 4.0.
+          sed -i '1s/^/set(ENV{CMAKE_POLICY_VERSION_MINIMUM} 3.5)\n/' "${VCPKG_INSTALLATION_ROOT}/scripts/ports.cmake"
+          echo "VCPKG_ROOT=${VCPKG_INSTALLATION_ROOT}" >> "$GITHUB_ENV"
+
+      #
+      # Cache handling
+      #
+      - name: Restore depends cache (Linux/macOS)
+        if: matrix.platform != 'windows'
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ./depends
+          key: ${{ matrix.artifact-suffix }}-${{ hashFiles('depends/packages/**') }}
+
+      - name: Restore vcpkg tools cache (Windows)
+        if: matrix.platform == 'windows'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: C:/vcpkg/downloads/tools
+          key: ${{ github.job }}-vcpkg-tools
+
+      - name: Restore vcpkg binary cache (Windows)
+        if: matrix.platform == 'windows'
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        id: vcpkg-binary-cache
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: ${{ github.job }}-vcpkg-binary-${{ hashFiles('cmake_version', 'msbuild_version', 'toolset_version', 'vcpkg.json') }}
+
+      #
+      # Build dependencies (Linux/macOS only - Windows uses vcpkg)
+      #
+      - name: Download dependencies (Linux)
+        if: matrix.platform == 'linux'
+        run: make -C ./depends download-linux
+
+      - name: Download dependencies (macOS)
+        if: matrix.platform == 'macos'
+        run: gmake -C ./depends download-osx
+
+      - name: Build dependencies (Linux)
+        if: matrix.platform == 'linux'
+        run: make -C ./depends -j4
+
+      - name: Build dependencies (macOS)
+        if: matrix.platform == 'macos'
+        run: gmake -C ./depends -j4
+
+      - name: Save depends cache (Linux/macOS)
+        if: matrix.platform != 'windows'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ./depends
+          key: ${{ matrix.artifact-suffix }}-${{ hashFiles('depends/packages/**') }}
+
+      #
+      # Configure and build
+      #
+      - name: Configure build (Linux)
+        if: matrix.platform == 'linux'
+        run: cmake -B build --toolchain depends/x86_64-pc-linux-gnu/toolchain.cmake
+
+      - name: Configure build (macOS)
+        if: matrix.platform == 'macos'
+        run: cmake -B build -DBUILD_GUI=ON --toolchain depends/*-apple-darwin*/toolchain.cmake
+
+      - name: Configure build (Windows)
+        if: matrix.platform == 'windows'
+        run: |
+          cmake -B build --preset vs2026-static \
+            -DBUILD_GUI=ON -DWITH_ZMQ=ON \
+            -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF -DBUILD_TESTS=OFF -DBUILD_UTIL=ON
+
+      - name: Save vcpkg binary cache (Windows)
+        if: matrix.platform == 'windows' && github.event_name != 'pull_request' && steps.vcpkg-binary-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: ${{ github.job }}-vcpkg-binary-${{ hashFiles('cmake_version', 'msbuild_version', 'toolset_version', 'vcpkg.json') }}
+
+      - name: Build (Linux/macOS)
+        if: matrix.platform != 'windows'
+        run: cmake --build build -j4
+
+      - name: Build (Windows)
+        if: matrix.platform == 'windows'
+        run: cmake --build build -j "$NUMBER_OF_PROCESSORS" --config Release
+
+      #
+      # Extract version and prepare artifacts
+      #
+      - name: Set version environment variable
+        run: |
+          if [ "${{ matrix.platform }}" == "macos" ]; then
+            VERSION=$(ggrep -oP "(?<=^CMAKE_PROJECT_VERSION:STATIC=).+(?=)" build/CMakeCache.txt)
+          else
+            VERSION=$(grep -oP "(?<=^CMAKE_PROJECT_VERSION:STATIC=).+(?=$)" build/CMakeCache.txt || \
+                      grep CMAKE_PROJECT_VERSION:STATIC build/CMakeCache.txt | cut -d= -f2)
+          fi
+          echo "ECASH_BITCOIN_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts/qt
+          mv "build/bin/${{ matrix.build-subdir }}bitcoind${{ matrix.exe-ext }}" artifacts/
+          mv "build/bin/${{ matrix.build-subdir }}bitcoin-cli${{ matrix.exe-ext }}" artifacts/
+          mv "build/bin/${{ matrix.build-subdir }}bitcoin-util${{ matrix.exe-ext }}" artifacts/
+          mv "build/bin/${{ matrix.build-subdir }}bitcoin-qt${{ matrix.exe-ext }}" artifacts/qt/
+          # Read by the publish job instead of parsing artifact names.
+          printf '%s\n' "$ECASH_BITCOIN_VERSION" > artifacts/VERSION
+
+      # Same recipe as contrib/devtools/split-debug.sh: debug info moves to a
+      # <name>.dbg beside the binary and is kept as a CI artifact, not published.
+      - name: Strip binaries (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          set -euo pipefail
+          mkdir -p debug
+          for bin in artifacts/bitcoind artifacts/bitcoin-cli artifacts/bitcoin-util artifacts/qt/bitcoin-qt; do
+            dbg="debug/$(basename "$bin").dbg"
+            objcopy --enable-deterministic-archives -p --only-keep-debug "$bin" "$dbg"
+            objcopy --enable-deterministic-archives -p --strip-debug "$bin"
+            strip --enable-deterministic-archives -p -s "$bin"
+            objcopy --enable-deterministic-archives -p --add-gnu-debuglink="$dbg" "$bin"
+          done
+          ls -l artifacts artifacts/qt debug
+
+      # Apple's strip re-applies the ad-hoc signature, so the result still runs
+      # on Apple Silicon. Debug info already lives outside the binary on macOS.
+      - name: Strip binaries (macOS)
+        if: matrix.platform == 'macos'
+        run: strip artifacts/bitcoind artifacts/bitcoin-cli artifacts/bitcoin-util artifacts/qt/bitcoin-qt
+
+      - name: Upload debug symbols (Linux)
+        if: matrix.platform == 'linux'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: debug-symbols-${{ env.ECASH_BITCOIN_VERSION }}${{ env.BRANCH_SUFFIX }}-${{ matrix.artifact-suffix }}
+          if-no-files-found: error
+          path: debug/*.dbg
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ecash-bitcoin-${{ env.ECASH_BITCOIN_VERSION }}${{ env.BRANCH_SUFFIX }}-${{ matrix.artifact-suffix }}
+          if-no-files-found: error
+          path: |
+            artifacts/VERSION
+            artifacts/bitcoind${{ matrix.exe-ext }}
+            artifacts/bitcoin-cli${{ matrix.exe-ext }}
+            artifacts/bitcoin-util${{ matrix.exe-ext }}
+            artifacts/qt/bitcoin-qt${{ matrix.exe-ext }}
+
+  publish:
+    name: Publish to releases.ecash.com
+    runs-on: ubuntu-24.04
+    needs: [check-release, build]
+    if: needs.check-release.outputs.should-upload == 'true'
+
+    # The environment's deployment-branch rules are what actually gate the secrets.
+    environment:
+      name: releases
+      url: https://releases.ecash.com/L1-ecash-bitcoin/${{ needs.check-release.outputs.channel }}/latest/release.json
+
+    permissions:
+      contents: read
+      # OIDC for Sigstore signing, plus storing the attestation.
+      id-token: write
+      attestations: write
+
+    env:
+      # Top-level prefix on the release server; other projects publish beside it.
+      PROJECT: L1-ecash-bitcoin
+      CHANNEL: ${{ needs.check-release.outputs.channel }}
+      COMMIT: ${{ github.sha }}
+      # Order is the order in release.json.
+      TARGETS: |
+        x86_64-unknown-linux-gnu
+        x86_64-w64-msvc
+        x86_64-apple-darwin
+        aarch64-apple-darwin
+
+    steps:
+      # No checkout and no third-party actions: nothing PR-influenced runs here.
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: ecash-bitcoin-*
+          path: downloads
+
+      - name: Assemble release bundles
+        id: assemble
+        env:
+          # File mtimes are set to this so re-runs produce identical zips.
+          SOURCE_TIMESTAMP: ${{ github.event.head_commit.timestamp }}
+        run: |
+          set -euo pipefail
+
+          # zip stores local-time DOS timestamps.
+          export TZ=UTC
+
+          SHORT="${COMMIT:0:12}"
+          mkdir -p release staging
+
+          VERSION=""
+          while IFS= read -r target; do
+            [ -n "$target" ] || continue
+
+            src=$(find downloads -mindepth 1 -maxdepth 1 -type d -name "ecash-bitcoin-*-${target}" | head -1)
+            if [ -z "$src" ]; then
+              echo "::error::No build artifact found for target ${target}"
+              exit 1
+            fi
+
+            if [ ! -f "$src/VERSION" ]; then
+              echo "::error::Artifact $src is missing its VERSION file"
+              exit 1
+            fi
+            v=$(tr -d '[:space:]' < "$src/VERSION")
+
+            # Every target must come from the same source tree.
+            if [ -z "$VERSION" ]; then
+              VERSION="$v"
+            elif [ "$VERSION" != "$v" ]; then
+              echo "::error::Version mismatch across targets: '$VERSION' vs '$v' (${target})"
+              exit 1
+            fi
+
+            dir="L1-ecash-bitcoin-${v}-${SHORT}-${target}"
+            mkdir -p "staging/$dir"
+            cp -a "$src/." "staging/$dir/"
+            rm -f "staging/$dir/VERSION"
+
+            # GitHub artifacts do not reliably round-trip the executable bit.
+            find "staging/$dir" -type f ! -name '*.exe' -exec chmod 755 {} +
+
+            # Reproducible: fixed mtimes, sorted entries, no extra fields. The
+            # immutable-path check on publish needs identical bytes on re-run.
+            if [ -n "$SOURCE_TIMESTAMP" ]; then
+              find "staging/$dir" -exec touch -d "$SOURCE_TIMESTAMP" {} +
+            fi
+            (cd staging && find "$dir" | LC_ALL=C sort \
+               | zip -q -X "../release/L1-ecash-bitcoin-${target}.zip" -@)
+          done <<< "$TARGETS"
+
+          (cd release && sha256sum ./*.zip | sed 's| \./| |' > SHA256SUMS)
+
+          # Machine-readable manifest for the downloads page / update checks.
+          (
+            cd release
+            jq -n \
+              --arg version   "$VERSION" \
+              --arg commit    "$COMMIT" \
+              --arg short     "$SHORT" \
+              --arg path      "${PROJECT}/${CHANNEL}/${SHORT}/" \
+              --argjson files "$(
+                for f in *.zip; do
+                  jq -n --arg name "$f" \
+                        --arg sha256 "$(sha256sum "$f" | cut -d' ' -f1)" \
+                        --argjson size "$(stat -c %s "$f")" \
+                        '{name: $name, sha256: $sha256, size: $size}'
+                done | jq -s '.'
+              )" \
+              '{version: $version, commit: $commit, commit_short: $short,
+                path: $path, files: $files}' > release.json
+          )
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT"     >> "$GITHUB_OUTPUT"
+
+          echo "--- release/ ---"
+          ls -l release
+          cat release/SHA256SUMS
+
+      # Signed SLSA provenance in Sigstore's public log; verifiable independently
+      # of the bucket. See doc/release-publishing.md.
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release/*.zip
+            release/SHA256SUMS
+            release/release.json
+
+      - name: Collect provenance bundle
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: cp "$BUNDLE_PATH" release/provenance.jsonl
+
+      - name: Publish to Cloudflare R2
+        env:
+          # R2 speaks S3. Credentials are scoped to this step only.
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          AWS_DEFAULT_REGION: auto
+          # R2 lacks the flexible-checksum headers newer CLIs send by default.
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          BUCKET: ${{ secrets.R2_BUCKET }}
+          SHORT: ${{ steps.assemble.outputs.short }}
+        run: |
+          set -euo pipefail
+
+          command -v aws >/dev/null || { echo "::error::aws CLI not found on runner"; exit 1; }
+          aws_ver=$(aws --version 2>&1 | sed -n 's#^aws-cli/\([0-9.]*\).*#\1#p')
+          if [ "$(printf '%s\n2.18.0\n' "$aws_ver" | sort -V | head -1)" != "2.18.0" ]; then
+            echo "::error::aws-cli $aws_ver is too old; conditional writes need >= 2.18.0"
+            exit 1
+          fi
+
+          prefix="${PROJECT}/${CHANNEL}/${SHORT}"
+          pointer="${PROJECT}/${CHANNEL}/latest"
+
+          content_type() {
+            case "$1" in
+              *.zip)   echo "application/zip" ;;
+              *.json)  echo "application/json" ;;
+              *.jsonl) echo "application/x-ndjson" ;;
+              *)       echo "text/plain; charset=utf-8" ;;
+            esac
+          }
+
+          # If-None-Match: * makes R2 reject writes to existing keys. Identical
+          # content on re-run is fine; different content fails loudly.
+          # provenance.jsonl is re-signed every run and never matches; it comes
+          # after the zips in glob order, so keeping the published one is safe.
+          put_immutable() {
+            local file="$1" key="$2" ctype sha err
+            ctype=$(content_type "$file")
+            sha=$(sha256sum "$file" | cut -d' ' -f1)
+            err=$(mktemp)
+
+            if aws s3api put-object \
+                  --bucket "$BUCKET" --key "$key" --body "$file" \
+                  --content-type "$ctype" \
+                  --cache-control 'public, max-age=31536000, immutable' \
+                  --metadata "sha256=$sha,commit=$COMMIT" \
+                  --if-none-match '*' >/dev/null 2>"$err"; then
+              echo "  put    $key"
+              rm -f "$err"
+              return 0
+            fi
+
+            if grep -qi 'PreconditionFailed\|(412)' "$err"; then
+              local remote
+              remote=$(aws s3api head-object --bucket "$BUCKET" --key "$key" \
+                         --query 'Metadata.sha256' --output text 2>/dev/null || echo "")
+              if [ "$remote" = "$sha" ]; then
+                echo "  skip   $key (already published, identical)"
+                rm -f "$err"
+                return 0
+              fi
+              if [ "$(basename "$file")" = "provenance.jsonl" ] && [ -n "$remote" ]; then
+                echo "  skip   $key (already published; keeping the original attestation bundle)"
+                rm -f "$err"
+                return 0
+              fi
+              echo "::error::$key already exists with different content (remote sha256=$remote, local sha256=$sha). Refusing to overwrite an immutable path."
+              rm -f "$err"
+              return 1
+            fi
+
+            cat "$err" >&2
+            rm -f "$err"
+            return 1
+          }
+
+          echo "Publishing immutable release to s3://$BUCKET/$prefix/"
+          for f in release/*; do
+            [ -f "$f" ] || continue
+            put_immutable "$f" "$prefix/$(basename "$f")"
+          done
+
+          # Pointer moves last, by server-side copy, once everything is published.
+          echo "Updating pointer s3://$BUCKET/$pointer/"
+          for f in release/*; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f")
+            # Published hash, not local: a re-run keeps the original provenance.jsonl.
+            sha=$(aws s3api head-object --bucket "$BUCKET" --key "$prefix/$name" \
+                    --query 'Metadata.sha256' --output text)
+            aws s3api copy-object \
+              --bucket "$BUCKET" \
+              --key "$pointer/$name" \
+              --copy-source "$BUCKET/$prefix/$name" \
+              --metadata-directive REPLACE \
+              --content-type "$(content_type "$f")" \
+              --cache-control 'public, max-age=60, must-revalidate' \
+              --metadata "sha256=$sha,commit=$COMMIT" >/dev/null
+            echo "  copy   $pointer/$name"
+          done
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.assemble.outputs.version }}
+          SHORT: ${{ steps.assemble.outputs.short }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Published to releases.ecash.com"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Channel | \`$CHANNEL\` |"
+            echo "| Version | \`$VERSION\` |"
+            echo "| Commit  | \`$COMMIT\` |"
+            echo
+            echo "**Downloads**"
+            echo
+            for f in release/*.zip; do
+              n=$(basename "$f")
+              echo "- [\`$n\`](https://releases.ecash.com/$PROJECT/$CHANNEL/$SHORT/$n)"
+            done
+            echo
+            echo "Manifest: <https://releases.ecash.com/$PROJECT/$CHANNEL/$SHORT/release.json>"
+            echo "&nbsp;&nbsp;moving pointer: <https://releases.ecash.com/$PROJECT/$CHANNEL/latest/release.json>"
+            echo
+            echo '```'
+            cat release/SHA256SUMS
+            echo '```'
+            echo
+            echo "Verify a download:"
+            echo
+            echo '```sh'
+            echo "gh attestation verify L1-ecash-bitcoin-<target>.zip --repo ${{ github.repository }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
