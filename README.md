@@ -1,3 +1,62 @@
+> This is a forked version of `bitcoin/bitcoin`. It branches off of v32.1
+> and applies a series of [eCash](https://ecash.com/)-related patches.
+
+## Prebuilt binaries
+Release tags are published to <https://releases.ecash.com>.
+```
+Verify a download before
+running it:
+```
+gh attestation verify L1-ecash-bitcoin-<version>-<target>.zip --repo ecash-com/bitcoin \
+  --signer-workflow ecash-com/releases/.github/workflows/publish.yml
+```
+
+## eCash build instructions (example uses ubuntu LTS (24.04))
+Install build dependencies:
+```git cmake build-essential libsqlite3-dev libboost-all-dev libzmq3-dev pkgconf```
+
+Build:
+```
+cmake -B build -DBUILD_GUI=OFF -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF -DBUILD_GUI_TESTS=OFF -DBUILD_TESTS=OFF -DENABLE_IPC=OFF -DWITH_ZMQ=ON -DBUILD_UTIL=ON
+cmake --build build -j $(nproc)
+```
+
+
+## Data directories & config files:
+```
+// Windows: C:\Users\Username\AppData\Local\eCash
+// macOS: ~/Library/Application Support/eCash
+// Unix-like: ~/.ecash
+```
+Config file name: `ecash.conf`
+
+
+## Ports
+Ports differ from Bitcoin Core so the two can run side by side.
+```
+              P2P     RPC
+mainnet       8533    8532
+testnet3      18533   18532
+testnet4      48533   48532
+signet        38533   38532
+regtest       18644   18643
+```
+Ports for incoming Tor connections are the P2P port plus one.
+
+
+## Network magic
+Each network uses its own message start bytes, so a node will not connect
+to Bitcoin Core peers.
+```
+mainnet       0xeca5dcb7
+testnet3      0xeca5b114
+testnet4      0xeca5b124
+regtest       0xeca5b134
+signet        derived from the signet challenge
+```
+
+---
+
 Bitcoin Core integration/staging tree
 =====================================
 
