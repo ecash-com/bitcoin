@@ -248,6 +248,10 @@ struct Peer {
     //! Whether this peer is an inbound connection
     const bool m_is_inbound;
 
+    //! Whether we speak Bitcoin's network magic to this peer. The bridge only
+    //! carries block data inwards, so nothing is ever announced to such peers.
+    const bool m_bitcoin_magic;
+
     /** Protects misbehavior data members */
     Mutex m_misbehavior_mutex;
     /** Whether this peer should be disconnected and marked as discouraged (unless it has NetPermissionFlags::NoBan permission). */
@@ -419,10 +423,11 @@ struct Peer {
      * timestamp the peer sent in the version message. */
     std::atomic<std::chrono::seconds> m_time_offset{0s};
 
-    explicit Peer(NodeId id, ServiceFlags our_services, bool is_inbound)
+    explicit Peer(NodeId id, ServiceFlags our_services, bool is_inbound, bool bitcoin_magic)
         : m_id{id}
         , m_our_services{our_services}
         , m_is_inbound{is_inbound}
+        , m_bitcoin_magic{bitcoin_magic}
     {}
 
 private:
@@ -1615,7 +1620,7 @@ void PeerManagerImpl::InitializeNode(const CNode& node, ServiceFlags our_service
         our_services = static_cast<ServiceFlags>(our_services | NODE_BLOOM);
     }
 
-    PeerRef peer = std::make_shared<Peer>(nodeid, our_services, node.IsInboundConn());
+    PeerRef peer = std::make_shared<Peer>(nodeid, our_services, node.IsInboundConn(), node.m_bitcoin_magic);
     {
         LOCK(m_peer_mutex);
         m_peer_map.emplace_hint(m_peer_map.end(), nodeid, peer);
@@ -2181,6 +2186,10 @@ void PeerManagerImpl::UpdatedBlockTip(const CBlockIndex *pindexNew, const CBlock
         LOCK(m_peer_mutex);
         for (auto& it : m_peer_map) {
             Peer& peer = *it.second;
+            // Our tip is only meaningful on our own chain; past the fork height a
+            // Bitcoin peer would reject it, and announcing it leaks this chain
+            // into Bitcoin's network.
+            if (peer.m_bitcoin_magic) continue;
             LOCK(peer.m_block_inv_mutex);
             for (const uint256& hash : vHashes | std::views::reverse) {
                 peer.m_blocks_for_headers_relay.push_back(hash);
@@ -3686,6 +3695,10 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         //   the peer may turn on transaction relay later.
         if (!pfrom.IsBlockOnlyConn() &&
             !pfrom.IsFeelerConn() &&
+            // Never announce our transactions to a Bitcoin peer, whatever fRelay
+            // they sent us: our transactions are stamped with the replay-protection
+            // nLockTime and belong on this chain only.
+            !pfrom.m_bitcoin_magic &&
             (fRelay || (peer.m_our_services & NODE_BLOOM))) {
             auto* const tx_relay = peer.SetTxRelay();
             {
@@ -5699,6 +5712,12 @@ bool PeerManagerImpl::SetupAddressRelay(const CNode& node, Peer& peer)
     // connections to prevent providing adversaries with the additional
     // information of addr traffic to infer the link.
     if (node.IsBlockOnlyConn()) return false;
+
+    // Peers reached over Bitcoin's magic are on a different network. Relaying
+    // their addresses onwards would fill our addrman -- and, via further relay,
+    // every peer's addrman -- with nodes that cannot speak our protocol, and
+    // announcing our peers to them would leak our network into Bitcoin's.
+    if (node.m_bitcoin_magic) return false;
 
     if (!peer.m_addr_relay_enabled.exchange(true)) {
         // During version message processing (non-block-relay-only outbound peers)
