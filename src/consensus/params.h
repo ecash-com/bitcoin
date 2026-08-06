@@ -84,6 +84,8 @@ struct BIP9Deployment {
 struct Params {
     uint256 hashGenesisBlock;
     int nSubsidyHalvingInterval;
+    /** Height at which the eCash fork activates. 0 means from genesis. */
+    int EcashHeight{0};
     /**
      * Hashes of blocks that
      * - are known to be consensus valid, and
