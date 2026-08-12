@@ -178,6 +178,13 @@ public:
                 .hash_serialized = AssumeutxoHash{uint256{"e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050"}},
                 .m_chain_tx_count = 1305397408,
                 .blockhash = uint256{"0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee"},
+            },
+            {
+                // drynet4 fork block (EcashHeight): first drynet4-own block.
+                .height = 961'632,
+                .hash_serialized = AssumeutxoHash{uint256{"bc468e130a3dcf9f09583d6b8955cb21fb6ee2629f1e43b6113d6d282728ab7a"}},
+                .m_chain_tx_count = 1413743102,
+                .blockhash = uint256{"00000000001e6f522e6b954cba44bf8c36d59c52beb5cf61158f44e39d0a76ae"},
             }
         };
 
