@@ -331,7 +331,7 @@ class Generate:
         self.action_time = max(self.action_time, self.mine_time - 6900)
 
     def gbt(self, bcli, bestblockhash, now):
-        tmpl = json.loads(bcli("getblocktemplate", '{"rules":["signet","segwit"]}'))
+        tmpl = json.loads(bcli("getblocktemplate", '{"rules":["signet","segwit","bip300301"]}'))
         if tmpl["previousblockhash"] != bestblockhash:
             logging.warning("GBT based off unexpected block (%s not %s), retrying", tmpl["previousblockhash"], bestblockhash)
             time.sleep(1)

@@ -617,6 +617,14 @@ static RPCHelpMan getblocktemplate()
         "getblocktemplate",
         "If the request parameters include a 'mode' key, that is used to explicitly select between the default 'template' request or a 'proposal'.\n"
         "It returns data needed to construct a block to work on.\n"
+        "\nWARNING: the template returned here is a plain layer 1 template. It does not carry the\n"
+        "BIP300/BIP301 commitments that sidechains rely on. Only bip300301_enforcer knows how to turn\n"
+        "it into a block that is safe to mine on, so requests in 'template' mode must acknowledge the\n"
+        "'bip300301' rule, and the template is returned with '!bip300301' in its rules: per BIP9 a\n"
+        "client that does not understand that rule must not mine the template, modified or not.\n"
+        "Miners must fetch their templates from bip300301_enforcer instead of calling this RPC\n"
+        "directly. To lift the requirement node-wide for testing, restart with\n"
+        "-deprecatedrpc=getblocktemplate.\n"
         "For full specification, see BIPs 22, 23, 9, and 145:\n"
         "    https://github.com/bitcoin/bips/blob/master/bip-0022.mediawiki\n"
         "    https://github.com/bitcoin/bips/blob/master/bip-0023.mediawiki\n"
@@ -633,6 +641,7 @@ static RPCHelpMan getblocktemplate()
                 {"rules", RPCArg::Type::ARR, RPCArg::Optional::NO, "A list of strings",
                 {
                     {"segwit", RPCArg::Type::STR, RPCArg::Optional::NO, "(literal) indicates client side segwit support"},
+                    {"bip300301", RPCArg::Type::STR, RPCArg::Optional::NO, "(literal) indicates that the client adds the BIP300/BIP301 commitments to the template"},
                     {"str", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "other client side supported softfork deployment"},
                 }},
                 {"longpollid", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "delay processing request until the result would vary significantly from the \"longpollid\" of a prior template"},
@@ -700,8 +709,8 @@ static RPCHelpMan getblocktemplate()
             }},
         },
         RPCExamples{
-                    HelpExampleCli("getblocktemplate", "'{\"rules\": [\"segwit\"]}'")
-            + HelpExampleRpc("getblocktemplate", "{\"rules\": [\"segwit\"]}")
+                    HelpExampleCli("getblocktemplate", "'{\"rules\": [\"segwit\", \"bip300301\"]}'")
+            + HelpExampleRpc("getblocktemplate", "{\"rules\": [\"segwit\", \"bip300301\"]}")
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
@@ -855,6 +864,15 @@ static RPCHelpMan getblocktemplate()
         throw JSONRPCError(RPC_INVALID_PARAMETER, "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})");
     }
 
+    // The template built below is a plain layer 1 template: it lacks the
+    // BIP300/BIP301 commitments, so mining it as-is would orphan sidechain
+    // activity. bip300301_enforcer fetches this template and adds those
+    // commitments before miners work on it, and acknowledges the rule to say
+    // so; every other caller is asked to go through the enforcer instead.
+    if (!setClientRules.contains("bip300301") && !IsDeprecatedRPCEnabled("getblocktemplate")) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "you should not be calling `getblocktemplate` from this daemon, instead call it from `bip300301_enforcer`");
+    }
+
     // Update block
     static CBlockIndex* pindexPrev;
     static int64_t time_start;
@@ -949,6 +967,9 @@ static RPCHelpMan getblocktemplate()
     UniValue aRules(UniValue::VARR);
     aRules.push_back("csv");
     if (!fPreSegWit) aRules.push_back("!segwit");
+    // Indicate to miners that they must understand the BIP300/BIP301
+    // commitments in the generation transaction before mining this template
+    aRules.push_back("!bip300301");
     if (consensusParams.signet_blocks) {
         // indicate to miner that they must understand signet rules
         // when attempting to mine with this template
