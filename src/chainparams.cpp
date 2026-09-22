@@ -46,6 +46,17 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
     if (auto value = args.GetBoolArg("-fastprune")) options.fastprune = *value;
     if (HasTestOption(args, "bip94")) options.enforce_bip94 = true;
 
+    if (args.IsArgSet("-testasertanchor")) {
+        const auto value{args.GetArg("-testasertanchor", "")};
+        const auto height{ToIntegral<int32_t>(value)};
+        if (!height || *height < 0) {
+            throw std::runtime_error(strprintf("Invalid height value (%s) for -testasertanchor=height; it must be at least 1, or 0 to disable.", value));
+        }
+        // 0 disables, so that -notestasertanchor (which sets the value to "0") means what
+        // negation means everywhere else rather than raising.
+        options.asert_anchor_height = *height;
+    }
+
     for (const std::string& arg : args.GetArgs("-testactivationheight")) {
         const auto found{arg.find('@')};
         if (found == std::string::npos) {

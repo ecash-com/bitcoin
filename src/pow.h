@@ -29,6 +29,24 @@ std::optional<arith_uint256> DeriveTarget(unsigned int nBits, uint256 pow_limit)
 unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader *pblock, const Consensus::Params&);
 unsigned int CalculateNextWorkRequired(const CBlockIndex* pindexLast, int64_t nFirstBlockTime, const Consensus::Params&);
 
+/** True when the block at `height` gets its target from ASERT rather than the 2016-block rule. */
+bool IsAsertHeight(const Consensus::Params& params, int64_t height);
+
+/**
+ * ASERT target for the block after pindexPrev.
+ *
+ * @param[in] pindexPrev         tip the new block builds on; must be at or above the anchor
+ * @param[in] pindexAnchorBlock  the anchor block (params.EcashAsertAnchorHeight); needs a parent
+ */
+unsigned int GetNextASERTWorkRequired(const CBlockIndex* pindexPrev, const CBlockIndex* pindexAnchorBlock, const Consensus::Params& params);
+
+/**
+ * aserti3-2d core: refTarget * 2^((nTimeDiff - nPowTargetSpacing*(nHeightDiff+1)) / nHalfLife),
+ * computed in fixed point with a cubic approximation of 2^x on [0,1).
+ * Pure function of its arguments; exposed for tests.
+ */
+arith_uint256 CalculateASERT(const arith_uint256& refTarget, int64_t nPowTargetSpacing, int64_t nTimeDiff, int64_t nHeightDiff, const arith_uint256& powLimit, int64_t nHalfLife) noexcept;
+
 /** Check whether a block hash satisfies the proof-of-work requirement specified by nBits */
 bool CheckProofOfWork(uint256 hash, unsigned int nBits, const Consensus::Params&);
 bool CheckProofOfWorkImpl(uint256 hash, unsigned int nBits, const Consensus::Params&);
@@ -41,6 +59,11 @@ bool CheckProofOfWorkImpl(uint256 hash, unsigned int nBits, const Consensus::Par
  * This function only checks that the new value is within a factor of 4 of the
  * old value for blocks at the difficulty adjustment interval, and otherwise
  * requires the values to be the same.
+ *
+ * At ASERT heights the target moves every block and a valid chain bounds
+ * that move only through median-time-past, so no fixed per-block limit is
+ * sound; the check there only rejects targets above powLimit. Headers sync
+ * at those heights relies on per-header proof of work and minimum chain work.
  *
  * Always returns true on networks where min difficulty blocks are allowed,
  * such as regtest/testnet.

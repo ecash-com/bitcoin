@@ -270,6 +270,7 @@ BASE_SCRIPTS = [
     'tool_utxo_to_sqlite.py',
     'feature_versionbits_warning.py',
     'feature_blocksxor.py',
+    'feature_asert.py',
     'rpc_preciousblock.py',
     'wallet_importprunedfunds.py',
     'p2p_leak_tx.py --v1transport',

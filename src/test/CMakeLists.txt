@@ -152,6 +152,7 @@ target_json_data_sources(test_bitcoin
   data/tx_valid.json
 )
 target_raw_data_sources(test_bitcoin NAMESPACE test::data
+  data/asert_test_vectors.raw
   data/asmap.raw
 )
 

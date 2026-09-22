@@ -2918,6 +2918,17 @@ void Chainstate::UpdateTip(const CBlockIndex* pindexNew)
     }
 
     std::vector<bilingual_str> warning_messages;
+    // The ASERT anchor is a flag day by height: a node on the wrong build computes a
+    // different target from the block above it and follows a different chain from there.
+    // Say so while there is still time to do something about it, not afterwards.
+    if (const int anchor{m_chainman.GetConsensus().EcashAsertAnchorHeight}; anchor > 0 && !m_chainman.IsInitialBlockDownload()) {
+        // The first block under ASERT is anchor + 1 (IsAsertHeight is height > anchor), so
+        // the countdown must still fire when the tip IS the anchor.
+        const int to_go{anchor + 1 - pindexNew->nHeight};
+        if (to_go > 0 && to_go <= 2016) {
+            warning_messages.push_back(strprintf(_("ASERT difficulty rule takes effect in %i blocks (anchor height %i); every node must run a build that agrees on it"), to_go, anchor));
+        }
+    }
     if (!m_chainman.IsInitialBlockDownload()) {
         auto bits = m_chainman.m_versionbitscache.CheckUnknownActivations(pindexNew, m_chainman.GetParams());
         for (auto [bit, active] : bits) {

@@ -5,6 +5,7 @@
 
 #include <kernel/chainparams.h>
 
+#include <arith_uint256.h>
 #include <chainparamsseeds.h>
 #include <consensus/amount.h>
 #include <consensus/merkle.h>
@@ -27,6 +28,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <span>
 #include <utility>
@@ -81,6 +83,17 @@ public:
         m_chain_type = ChainType::MAIN;
         consensus.EcashHeight = 967680; // Retarget boundary, 2016 * 480
         consensus.EcashForkBits = 0x19044b7e; // Difficulty 1e9 at the fork block
+        // ASERT is off until an anchor is chosen. Proposed: mainnet anchors at its fork
+        // block (EcashAsertAnchorHeight = EcashHeight); betanet at a boundary agreed by
+        // its node operators, since it is already past its fork.
+        consensus.EcashAsertAnchorHeight = 0;
+        // Two days, the aserti3-2d value BCH has run since Nov 2020. A shorter half-life
+        // gives faster relief but is not free: it doubles the leverage of timestamp
+        // manipulation against MAX_FUTURE_BLOCK_TIME, and it makes a dormant chain cheap
+        // far sooner. Drivechain withdrawal and slot-eviction windows are counted in
+        // blocks (13,150 of 26,300), not in work, so difficulty that has decayed during a
+        // stall prices the cost of buying such a window. See doc/asert.md.
+        consensus.EcashAsertHalfLife = 2 * 24 * 60 * 60; // two days
         consensus.signet_blocks = false;
         consensus.signet_challenge.clear();
         consensus.nSubsidyHalvingInterval = 210000;
@@ -629,9 +642,47 @@ public:
         }
 
         genesis = CreateGenesisBlock(1296688602, 2, 0x207fffff, 1, 50 * COIN);
-        consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"});
-        assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
+        if (opts.asert_anchor_height > 0) {
+            // A regtest chain that actually exercises ASERT. The defaults cannot: a chain
+            // that never retargets never reaches the anchor branch, min-difficulty blocks
+            // are refused an anchor by the chainparams sanity check, and a powLimit of
+            // 2^255 would clamp every result (CalculateASERT is exact only below 2^239).
+            // So this one switch sets all four. Debug-only, regtest-only; -testasertanchor.
+            //
+            // The limit is also held below (2^256-1) / (4 * nPowTargetTimespan), because
+            // turning retargeting back on makes CalculateNextWorkRequired reachable and it
+            // multiplies the limit by the clamped timespan. ChainParams_REGTEST_ASERT_sanity
+            // pins both bounds.
+            //
+            // Note for anyone combining this with other regtest machinery: the genesis
+            // block differs from the stock one, so m_assumeutxo_data below -- and anything
+            // else keyed to the stock regtest chain -- does not apply under this flag.
+            consensus.powLimit = uint256{"00001fffff000000000000000000000000000000000000000000000000000000"}; // compact 0x1e1fffff
+            consensus.fPowNoRetargeting = false;
+            consensus.fPowAllowMinDifficultyBlocks = false;
+            consensus.EcashAsertAnchorHeight = opts.asert_anchor_height;
+            consensus.EcashAsertHalfLife = 2 * 24 * 60 * 60; // two days, as on main
+
+            // The stock genesis does not satisfy the lower limit, so re-grind it. Only the
+            // header changes, so the block itself is built once.
+            const arith_uint256 genesis_target{UintToArith256(consensus.powLimit)};
+            genesis.nBits = genesis_target.GetCompact();
+            bool solved{false};
+            for (uint32_t nonce = 0; nonce != std::numeric_limits<uint32_t>::max(); ++nonce) {
+                genesis.nNonce = nonce;
+                if (UintToArith256(genesis.GetHash()) <= genesis_target) {
+                    solved = true;
+                    break;
+                }
+            }
+            assert(solved);
+            consensus.hashGenesisBlock = genesis.GetHash();
+            assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
+        } else {
+            consensus.hashGenesisBlock = genesis.GetHash();
+            assert(consensus.hashGenesisBlock == uint256{"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"});
+            assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
+        }
 
         vFixedSeeds.clear(); //!< Regtest mode doesn't have any fixed seeds.
         vSeeds.clear();

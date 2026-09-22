@@ -89,6 +89,16 @@ struct Params {
     /** Compact target the block at EcashHeight must carry. */
     uint32_t EcashForkBits{0};
     /**
+     * ASERT difficulty adjustment (aserti3-2d). The block at this height is
+     * the anchor: it is the last block whose nBits come from the 2016-block
+     * rule (on mainnet, the fork block carrying EcashForkBits). Every block
+     * above it gets its target from the anchor and the clock alone.
+     * 0 disables ASERT and keeps the 2016-block rule everywhere.
+     */
+    int EcashAsertAnchorHeight{0};
+    /** ASERT half-life in seconds: the schedule slip that doubles or halves the target. */
+    int64_t EcashAsertHalfLife{0};
+    /**
      * Hashes of blocks that
      * - are known to be consensus valid, and
      * - buried in the chain, and

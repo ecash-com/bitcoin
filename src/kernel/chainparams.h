@@ -152,6 +152,13 @@ public:
         std::unordered_map<Consensus::BuriedDeployment, int> activation_heights{};
         bool fastprune{false};
         bool enforce_bip94{false};
+        /**
+         * Debug-only: put this regtest chain under ASERT with the given anchor height.
+         * Non-zero also turns off fPowNoRetargeting and min-difficulty blocks and lowers
+         * powLimit (with a matching genesis), because none of them can coexist with a
+         * per-block difficulty rule. See -testasertanchor.
+         */
+        int asert_anchor_height{0};
     };
 
     static std::unique_ptr<const CChainParams> RegTest(const RegTestOptions& options);

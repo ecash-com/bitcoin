@@ -122,3 +122,22 @@ FUZZ_TARGET(pow_transition, .init = initialize_pow)
     unsigned int new_nbits{GetNextWorkRequired(last_block, nullptr, consensus_params)};
     Assert(PermittedDifficultyTransition(consensus_params, last_block->nHeight + 1, last_block->nBits, new_nbits));
 }
+
+FUZZ_TARGET(pow_asert, .init = initialize_pow)
+{
+    FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
+    const Consensus::Params& consensus_params{Params().GetConsensus()};
+    const arith_uint256 pow_limit = UintToArith256(consensus_params.powLimit);
+
+    arith_uint256 ref_target;
+    ref_target.SetCompact(fuzzed_data_provider.ConsumeIntegral<uint32_t>());
+    if (ref_target == 0 || ref_target > pow_limit) ref_target = pow_limit;
+
+    const int64_t time_diff{fuzzed_data_provider.ConsumeIntegral<int64_t>()};
+    const int64_t height_diff{fuzzed_data_provider.ConsumeIntegralInRange<int64_t>(0, std::numeric_limits<int64_t>::max())};
+    const int64_t half_life{fuzzed_data_provider.ConsumeIntegralInRange<int64_t>(1, std::numeric_limits<int64_t>::max())};
+
+    const arith_uint256 next_target{CalculateASERT(ref_target, consensus_params.nPowTargetSpacing, time_diff, height_diff, pow_limit, half_life)};
+    Assert(next_target >= arith_uint256{1});
+    Assert(next_target <= pow_limit);
+}

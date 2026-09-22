@@ -941,6 +941,16 @@ bool AppInitParameterInteraction(const ArgsManager& args)
     if (chain == ChainType::SIGNET) {
         LogInfo("Signet derived magic (message start): %s", HexStr(chainparams.MessageStart()));
     }
+    if (const int anchor{chainparams.GetConsensus().EcashAsertAnchorHeight}; anchor > 0) {
+        // A non-zero anchor is a consensus rule this build applies and an older build does
+        // not. Today the only way an operator finds out they are on the wrong side of it is
+        // by forking off it, so say it plainly at startup, once, in the clear.
+        LogWarning("This build applies the ASERT difficulty rule to every block above height %d "
+                   "(the anchor; half-life %ds). Those blocks have a target that a build without "
+                   "this rule computes differently: nodes that disagree on this height do not "
+                   "share a chain.",
+                   anchor, chainparams.GetConsensus().EcashAsertHalfLife);
+    }
     bilingual_str errors;
     for (const auto& arg : args.GetUnsuitableSectionOnlyArgs()) {
         errors += strprintf(_("Config setting for %s only applied on %s network when in [%s] section."), arg, ChainTypeToString(chain), ChainTypeToString(chain)) + Untranslated("\n");
