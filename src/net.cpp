@@ -61,6 +61,19 @@ TRACEPOINT_SEMAPHORE(net, outbound_message);
  * under our own magic. */
 static constexpr MessageStartChars BITCOIN_MAINNET_MAGIC{0xf9, 0xbe, 0xb4, 0xd9};
 
+/** Magic spoken to -bitcoinpeer peers: Bitcoin mainnet's, or -bitcoinpeermagic on regtest (tests). */
+static MessageStartChars BitcoinPeerMagic()
+{
+    if (Params().GetChainType() == ChainType::REGTEST) {
+        if (const auto bytes{TryParseHex<uint8_t>(gArgs.GetArg("-bitcoinpeermagic", ""))}; bytes && bytes->size() == 4) {
+            MessageStartChars magic;
+            std::copy(bytes->begin(), bytes->end(), magic.begin());
+            return magic;
+        }
+    }
+    return BITCOIN_MAINNET_MAGIC;
+}
+
 /** Maximum number of block-relay-only anchor connections */
 static constexpr size_t MAX_BLOCK_RELAY_ONLY_ANCHORS = 2;
 static_assert (MAX_BLOCK_RELAY_ONLY_ANCHORS <= static_cast<size_t>(MAX_BLOCK_RELAY_ONLY_CONNECTIONS), "MAX_BLOCK_RELAY_ONLY_ANCHORS must not exceed MAX_BLOCK_RELAY_ONLY_CONNECTIONS.");
@@ -554,7 +567,7 @@ CNode* CConnman::ConnectNode(CAddress addrConnect,
                                     .i2p_sam_session = std::move(i2p_transient_session),
                                     .recv_flood_size = nReceiveFloodSize,
                                     .use_v2transport = use_v2transport,
-                                    .magic = bitcoin_magic ? std::optional{BITCOIN_MAINNET_MAGIC} : std::nullopt,
+                                    .magic = bitcoin_magic ? std::optional{BitcoinPeerMagic()} : std::nullopt,
                                 });
         pnode->AddRef();
 

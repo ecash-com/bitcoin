@@ -320,6 +320,7 @@ void Shutdown(NodeContext& node)
     // using the other before destroying them.
     if (node.peerman && node.validation_signals) node.validation_signals->UnregisterValidationInterface(node.peerman.get());
     if (node.connman) node.connman->Stop();
+    if (node.peerman) node.peerman->FlushBridge();
 
     StopTorControl();
 
@@ -540,6 +541,13 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
 
     argsman.AddArg("-addnode=<ip>", strprintf("Add a node to connect to and attempt to keep the connection open (see the addnode RPC help for more info). This option can be specified multiple times to add multiple nodes; connections are limited to %u at a time and are counted separately from the -maxconnections limit.", MAX_ADDNODE_CONNECTIONS), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-bitcoinpeer=<ip>", "Connect to an operator-controlled, unpruned Bitcoin full node using Bitcoin's network magic, to fetch the pre-fork chain and, past the fork, feed our mempool from Bitcoin blocks. The connection should use loopback or a trusted private network because Bitcoin P2P is not authenticated. Up to four peers may be given when the block feed is active: one fetches blocks at a time, the others follow headers and take over if it disconnects or stalls. Each peer must advertise NODE_NETWORK and NODE_WITNESS. Always v1; never relays addresses or transaction gossip. Seed-node use only.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-bitcoinpeermagic=<hex>", "Speak this 4-byte network magic to -bitcoinpeer peers instead of Bitcoin mainnet's (regtest only, for tests).",
+                   ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-bridgeheldmaxweight=<n>", strprintf("Pause fetching Bitcoin blocks while the transactions held from our last %d blocks weigh at least <n> weight units; nothing held is dropped (default: %u)",
+                                                       BRIDGE_HELD_YOUNG_BLOCKS, DEFAULT_BRIDGE_HELD_MAX_WEIGHT),
+                   ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-ecashheight=<n>", "Fork height at which eCash rules and the Bitcoin block feed activate (regtest only, for tests).",
+                   ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
     argsman.AddArg("-asmap=<file>", strprintf("Specify asn mapping used for bucketing of the peers. Relative paths will be prefixed by the net-specific datadir location.%s",
                 #ifdef ENABLE_EMBEDDED_ASMAP
                     " If a bool arg is given (-asmap or -asmap=1), the embedded mapping data in the binary will be used."

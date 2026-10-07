@@ -559,6 +559,8 @@ public:
     explicit CRegTestParams(const RegTestOptions& opts)
     {
         m_chain_type = ChainType::REGTEST;
+        consensus.EcashHeight = opts.ecash_height; // regtest only (tests); 0 = plain Bitcoin regtest
+        consensus.EcashForkBits = 0x207fffff;      // regtest powLimit: the fork block keeps regtest difficulty
         consensus.signet_blocks = false;
         consensus.signet_challenge.clear();
         consensus.nSubsidyHalvingInterval = 150;

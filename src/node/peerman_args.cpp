@@ -25,6 +25,10 @@ void ApplyArgsManOptions(const ArgsManager& argsman, PeerManager::Options& optio
     if (auto value{argsman.GetBoolArg("-blocksonly")}) options.ignore_incoming_txs = *value;
 
     if (auto value{argsman.GetBoolArg("-privatebroadcast")}) options.private_broadcast = *value;
+
+    if (auto value{argsman.GetIntArg("-bridgeheldmaxweight")}) {
+        options.bridge_held_max_weight = uint64_t(std::max<int64_t>(*value, 1));
+    }
 }
 
 } // namespace node

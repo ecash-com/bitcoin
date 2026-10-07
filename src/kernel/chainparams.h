@@ -152,6 +152,7 @@ public:
         std::unordered_map<Consensus::BuriedDeployment, int> activation_heights{};
         bool fastprune{false};
         bool enforce_bip94{false};
+        int ecash_height{0}; //!< regtest only: fork height for eCash rules + the Bitcoin block feed (tests)
     };
 
     static std::unique_ptr<const CChainParams> RegTest(const RegTestOptions& options);

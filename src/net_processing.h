@@ -73,10 +73,21 @@ struct PeerManagerInfo {
     bool ignores_incoming_txs{false};
 };
 
+/** Bridge: the Bitcoin feed pauses while the transactions held from our recent blocks weigh this much. A Bitcoin
+ * block is 4 MWU, so this is a hundred blocks' worth -- about 100 MB serialized and 200-400 MB in memory at the
+ * limit, on top of the mempool. Nothing is refused when it is reached; the blocks wait on the Bitcoin node. */
+static constexpr uint64_t DEFAULT_BRIDGE_HELD_MAX_WEIGHT{100 * 4'000'000};
+/** Bridge: a held transaction counts toward that limit for this many of our blocks. Older ones -- which may never
+ * clear, like a transaction below the relay floor whose paying child is dead -- are kept, but no longer hold up the
+ * feed; the age is in our blocks, so the pause still holds while our chain itself is stalled. */
+static constexpr int BRIDGE_HELD_YOUNG_BLOCKS{144};
+
 class PeerManager : public CValidationInterface, public NetEventsInterface
 {
 public:
     struct Options {
+        //! Bridge: weight held from our last BRIDGE_HELD_YOUNG_BLOCKS blocks at which the Bitcoin feed pauses
+        uint64_t bridge_held_max_weight{DEFAULT_BRIDGE_HELD_MAX_WEIGHT};
         //! Whether this node is running in -blocksonly mode
         bool ignore_incoming_txs{DEFAULT_BLOCKSONLY};
         //! Whether transaction reconciliation protocol is enabled
@@ -100,6 +111,9 @@ public:
                                              BanMan* banman, ChainstateManager& chainman,
                                              CTxMemPool& pool, node::Warnings& warnings, Options opts);
     virtual ~PeerManager() = default;
+
+    /** Bridge: write what the Bitcoin block feed tracks. Called at shutdown, once the message handler has stopped. */
+    virtual void FlushBridge() {}
 
     /**
      * Attempt to manually fetch block from a given peer. We must already have the header.
