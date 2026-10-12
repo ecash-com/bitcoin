@@ -84,7 +84,9 @@ struct BIP9Deployment {
 struct Params {
     uint256 hashGenesisBlock;
     int nSubsidyHalvingInterval;
-    /** Height at which the eCash fork activates. 0 means from genesis. */
+    /** Height at which the eCash fork activates (fork difficulty, timewarp rule from this height).
+     * 0 means no fork from Bitcoin: such a network gets no timewarp check from this field and must
+     * set enforce_BIP94 for it. */
     int EcashHeight{0};
     /** Compact target the block at EcashHeight must carry. */
     uint32_t EcashForkBits{0};
