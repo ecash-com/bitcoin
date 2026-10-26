@@ -11,13 +11,16 @@
 #include <uint256.h>
 #include <util/check.h>
 
+#include <algorithm>
+
 unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader *pblock, const Consensus::Params& params)
 {
     assert(pindexLast != nullptr);
     unsigned int nProofOfWorkLimit = UintToArith256(params.powLimit).GetCompact();
+    const int64_t interval = params.DifficultyAdjustmentInterval(pindexLast->nHeight + 1);
 
     // Only change once per difficulty adjustment interval
-    if ((pindexLast->nHeight+1) % params.DifficultyAdjustmentInterval() != 0)
+    if ((pindexLast->nHeight+1) % interval != 0)
     {
         if (params.fPowAllowMinDifficultyBlocks)
         {
@@ -30,7 +33,7 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHead
             {
                 // Return the last non-special-min-difficulty-rules-block
                 const CBlockIndex* pindex = pindexLast;
-                while (pindex->pprev && pindex->nHeight % params.DifficultyAdjustmentInterval() != 0 && pindex->nBits == nProofOfWorkLimit)
+                while (pindex->pprev && pindex->nHeight % interval != 0 && pindex->nBits == nProofOfWorkLimit)
                     pindex = pindex->pprev;
                 return pindex->nBits;
             }
@@ -38,8 +41,12 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHead
         return pindexLast->nBits;
     }
 
-    // Go back by what we want to be 14 days worth of blocks
-    int nHeightFirst = pindexLast->nHeight - (params.DifficultyAdjustmentInterval()-1);
+    // Measure the time between the first and last blocks of the period.
+    int nHeightFirst = pindexLast->nHeight - (interval-1);
+    if (params.EcashHeight > 0 && pindexLast->nHeight + 1 > params.EcashHeight) {
+        // Share the previous window's endpoint, without reaching before the fork.
+        nHeightFirst = std::max(nHeightFirst - 1, params.EcashHeight);
+    }
     assert(nHeightFirst >= 0);
     const CBlockIndex* pindexFirst = pindexLast->GetAncestor(nHeightFirst);
     assert(pindexFirst);
@@ -52,12 +59,15 @@ unsigned int CalculateNextWorkRequired(const CBlockIndex* pindexLast, int64_t nF
     if (params.fPowNoRetargeting)
         return pindexLast->nBits;
 
+    const bool ecash_daa = params.EcashHeight > 0 && pindexLast->nHeight + 1 >= params.EcashHeight;
+    const int64_t target_timespan = ecash_daa ? params.DifficultyAdjustmentInterval(pindexLast->nHeight + 1) * params.nPowTargetSpacing : params.nPowTargetTimespan;
+
     // Limit adjustment step
     int64_t nActualTimespan = pindexLast->GetBlockTime() - nFirstBlockTime;
-    if (nActualTimespan < params.nPowTargetTimespan/4)
-        nActualTimespan = params.nPowTargetTimespan/4;
-    if (nActualTimespan > params.nPowTargetTimespan*4)
-        nActualTimespan = params.nPowTargetTimespan*4;
+    if (nActualTimespan < target_timespan/4)
+        nActualTimespan = target_timespan/4;
+    if (nActualTimespan > target_timespan*4)
+        nActualTimespan = target_timespan*4;
 
     // Retarget
     const arith_uint256 bnPowLimit = UintToArith256(params.powLimit);
@@ -68,15 +78,21 @@ unsigned int CalculateNextWorkRequired(const CBlockIndex* pindexLast, int64_t nF
         // Here we use the first block of the difficulty period. This way
         // the real difficulty is always preserved in the first block as
         // it is not allowed to use the min-difficulty exception.
-        int nHeightFirst = pindexLast->nHeight - (params.DifficultyAdjustmentInterval()-1);
+        int nHeightFirst = pindexLast->nHeight - (params.DifficultyAdjustmentInterval(pindexLast->nHeight + 1)-1);
         const CBlockIndex* pindexFirst = pindexLast->GetAncestor(nHeightFirst);
         bnNew.SetCompact(pindexFirst->nBits);
     } else {
         bnNew.SetCompact(pindexLast->nBits);
     }
 
-    bnNew *= nActualTimespan;
-    bnNew /= params.nPowTargetTimespan;
+    if (ecash_daa) {
+        // Target = (6 * old target + measured target) / 7.
+        bnNew *= 6 * target_timespan + nActualTimespan;
+        bnNew /= 7 * target_timespan;
+    } else {
+        bnNew *= nActualTimespan;
+        bnNew /= target_timespan;
+    }
 
     // eCash fork activation difficulty reset
     if (pindexLast->nHeight + 1 == params.EcashHeight)
@@ -93,10 +109,13 @@ unsigned int CalculateNextWorkRequired(const CBlockIndex* pindexLast, int64_t nF
 bool PermittedDifficultyTransition(const Consensus::Params& params, int64_t height, uint32_t old_nbits, uint32_t new_nbits)
 {
     if (params.fPowAllowMinDifficultyBlocks) return true;
+    if (params.EcashHeight > 0 && height == params.EcashHeight) return new_nbits == params.EcashForkBits;
 
-    if (height % params.DifficultyAdjustmentInterval() == 0) {
-        int64_t smallest_timespan = params.nPowTargetTimespan/4;
-        int64_t largest_timespan = params.nPowTargetTimespan*4;
+    if (height % params.DifficultyAdjustmentInterval(height) == 0) {
+        const bool ecash_daa = params.EcashHeight > 0 && height >= params.EcashHeight;
+        const int64_t target_timespan = ecash_daa ? params.DifficultyAdjustmentInterval(height) * params.nPowTargetSpacing : params.nPowTargetTimespan;
+        int64_t smallest_timespan = target_timespan/4;
+        int64_t largest_timespan = target_timespan*4;
 
         const arith_uint256 pow_limit = UintToArith256(params.powLimit);
         arith_uint256 observed_new_target;
@@ -105,8 +124,8 @@ bool PermittedDifficultyTransition(const Consensus::Params& params, int64_t heig
         // Calculate the largest difficulty value possible:
         arith_uint256 largest_difficulty_target;
         largest_difficulty_target.SetCompact(old_nbits);
-        largest_difficulty_target *= largest_timespan;
-        largest_difficulty_target /= params.nPowTargetTimespan;
+        largest_difficulty_target *= ecash_daa ? 6 * target_timespan + largest_timespan : largest_timespan;
+        largest_difficulty_target /= ecash_daa ? 7 * target_timespan : target_timespan;
 
         if (largest_difficulty_target > pow_limit) {
             largest_difficulty_target = pow_limit;
@@ -121,8 +140,8 @@ bool PermittedDifficultyTransition(const Consensus::Params& params, int64_t heig
         // Calculate the smallest difficulty value possible:
         arith_uint256 smallest_difficulty_target;
         smallest_difficulty_target.SetCompact(old_nbits);
-        smallest_difficulty_target *= smallest_timespan;
-        smallest_difficulty_target /= params.nPowTargetTimespan;
+        smallest_difficulty_target *= ecash_daa ? 6 * target_timespan + smallest_timespan : smallest_timespan;
+        smallest_difficulty_target /= ecash_daa ? 7 * target_timespan : target_timespan;
 
         if (smallest_difficulty_target > pow_limit) {
             smallest_difficulty_target = pow_limit;
