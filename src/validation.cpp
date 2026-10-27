@@ -4154,9 +4154,15 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
     if (block.GetBlockTime() <= pindexPrev->GetMedianTimePast())
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "time-too-old", "block's timestamp is too early");
 
-    // Testnet4 and regtest only: Check timestamp against prev for difficulty-adjustment
-    // blocks to prevent timewarp attacks (see https://github.com/bitcoin/bitcoin/pull/15482).
-    if (consensusParams.enforce_BIP94) {
+    // Check timestamp against prev for difficulty-adjustment blocks to prevent timewarp
+    // attacks (see https://github.com/bitcoin/bitcoin/pull/15482). Testnet4, and regtest with
+    // -test=bip94, enforce it from genesis. eCash enforces it from the fork height, not genesis:
+    // Bitcoin block 203,616 is stamped 1,127 seconds before its parent. It applies at every
+    // 2016th height, also once ASERT sets the difficulty. A template source must set mintime to
+    // at least prev - MAX_TIMEWARP at these heights (node::GetMinimumTime does), or its miners
+    // build blocks this check rejects.
+    if (consensusParams.enforce_BIP94 ||
+        (consensusParams.EcashHeight > 0 && nHeight >= consensusParams.EcashHeight)) {
         // Check timestamp for the first block of each difficulty adjustment
         // interval, except the genesis block.
         if (nHeight % consensusParams.DifficultyAdjustmentInterval(nHeight) == 0) {
